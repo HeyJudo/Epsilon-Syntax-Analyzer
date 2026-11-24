@@ -1,0 +1,38 @@
+# An INVALID program for the syntax analyzer. Every line marked ERROR
+# should be reported once, with its line number, and parsing continues.
+integer count = 0
+decimal max_temp = 0.0
+string name = "Juan"
+vector scores = [1, 2, 3]
+input()
+input(total)
+input count)
+input(scores)
+input(while)
+integer = 1
+integer x y
+integer w += 1
+count = max_temp
+max_temp = current_temp = count
+name += 1
+print("Score: " count)
+print()
+5 = count
+mean = 2
+vector bad = [1, 2,]
+integer m = 0
+while m + 1 {
+    m += 1
+}
+if count > 1 {
+    print(count)
+} else {
+    print(y)
+}
+elif count > 0 {
+    print("no")
+}
+}
+while count < 10
+    count += 1
+print("end")

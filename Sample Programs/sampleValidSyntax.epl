@@ -1,0 +1,92 @@
+# A VALID program for the syntax analyzer. It uses every statement type
+# and every form described in the Syntax Analyzer document.
+
+/* Declarations: one variable, a list, with assignment, and mixed forms */
+integer sample_size
+integer x, y, z
+let integer count = 0
+integer i = 1, j, k = 2
+decimal total = 150
+decimal current_temp = 36.5, max_temp = 0.0
+character grade = 'A'
+string name = "Juan"
+boolean passed = true
+vector scores = []
+vector weights = [50, 51, 52]
+vector values = [10,
+                 20,
+                 30]
+
+# Input statements
+input(sample_size)
+input from (name)
+input(x) # a trailing comment is ignored
+
+# Output statements: string, variable, string with variable, and a list
+print("Hello World")
+print(count)
+print("Score: ", count)
+print(total / count, name, passed)
+print(the mean(weights[0:2]))
+print using (median of (weights), mode(weights), variance(weights))
+
+# Assignment statements: variable, constant, and expression forms
+max_temp = current_temp
+current_temp = count
+count = -5
+grade = 'B'
+x += 1
+y -= 2
+z *= 3
+total /= 4
+i %= 60
+k ^= 2
+weights += 5
+values = weights + values
+x = (i + j) * k // 2 ^ 3 ^ 2
+passed = not (x == y) and x > 0 or count <= 10
+
+# Conditional statements: if, if else, if elif else, and nested
+if x > 1 {
+    print("x is big")
+}
+
+if passed
+{
+    print("passed")
+}
+else
+{
+    print("failed")
+}
+
+if count >= 75 {
+    grade = 'A'
+} elif count >= 50 {
+    grade = 'B'
+} elif count not= 0 {
+    grade = 'C'
+} else {
+    if count < 0 {
+        print("negative")
+    }
+    grade = 'F'
+}
+
+# Iterative statements: a single loop and a nested loop
+integer n = 0
+while n < 3
+{
+    input(n)
+    n += 1
+}
+
+while i <= 3 {
+    j = 0
+    while j < 2 {
+        print(i, j)
+        j += 1
+    }
+    i += 1
+}
+print("done")
