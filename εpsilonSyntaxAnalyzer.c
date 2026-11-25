@@ -203,6 +203,7 @@ static int pendingCount;
 static int panicMode;
 static int afterRecovery;
 static int offendingIsName;
+static int missingBraceReported;
 
 static int parseStatement(int parent);
 static int parseExpression(int parent);
@@ -908,7 +909,11 @@ static void parseBlock(int parent, const char *name) {
         }
     }
     if (tokenType == TOKEN_END_OF_FILE) {
-        syntaxError("'}' expected to close the %s.", name);
+        if (!missingBraceReported) {
+            missingBraceReported = 1;
+            afterRecovery = 0;
+            syntaxError("'}' expected to close the %s.", name);
+        }
         return;
     }
     matchToken(node);
