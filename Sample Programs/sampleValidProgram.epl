@@ -6,10 +6,13 @@
 let integer count = 0
 integer i = 1, j, k = 2
 integer x, y
+integer z
+integer offset = -1
 decimal total = 150
 decimal avg = 0.0, limit = 72.5
 character grade = 'A'
 string name = "Juan"
+string note = ""
 boolean passed = true
 boolean failed = false
 vector scores = []

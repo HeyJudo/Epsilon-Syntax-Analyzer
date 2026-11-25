@@ -1,7 +1,10 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+
+#ifdef _WIN32
+__declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int codePage);
+#endif
 
 enum {
     TOKEN_ERROR,
@@ -138,43 +141,38 @@ static const char *tokenName[TOKEN_TYPE_COUNT] = {
     [TOKEN_COLON] = "COLON"
 };
 
-enum {
-    TYPE_UNKNOWN,
-    TYPE_INTEGER,
-    TYPE_DECIMAL,
-    TYPE_CHARACTER,
-    TYPE_STRING,
-    TYPE_BOOLEAN,
-    TYPE_VECTOR,
-    TYPE_NUMBER,
-    TYPE_COUNT
-};
-
-static const char *typeName[TYPE_COUNT] = {
-    [TYPE_UNKNOWN] = "unknown",
-    [TYPE_INTEGER] = "integer",
-    [TYPE_DECIMAL] = "decimal",
-    [TYPE_CHARACTER] = "character",
-    [TYPE_STRING] = "string",
-    [TYPE_BOOLEAN] = "boolean",
-    [TYPE_VECTOR] = "vector",
-    [TYPE_NUMBER] = "number"
-};
+#define TREE_BRANCH "\xE2\x94\x9C\xE2\x94\x80\xE2\x94\x80 "
+#define TREE_LAST "\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 "
+#define TREE_PIPE "\xE2\x94\x82   "
+#define TREE_SPACE "    "
+#define TREE_ARROW " \xE2\x86\x92 "
 
 #define ROW_MAX 4096
-#define LEXEME_MAX 256
+#define LEXEME_MAX 128
 #define LABEL_MAX 200
-#define LINE_MAX 4096
+#define TREE_LINE_MAX 4096
 #define PREFIX_MAX 1024
+#define MAX_STATEMENT_TOKENS 10000
 #define MAX_NODES 20000
 #define NAME_MAX 64
-#define MAX_VARIABLES 500
 #define MAX_ERRORS 500
 #define MESSAGE_MAX 256
 #define PATH_MAX_LENGTH 1024
 
 static FILE *symbolTable;
 static FILE *treeFile;
+
+static int readType;
+static int readLine;
+static char readLexeme[LEXEME_MAX];
+static int lastReadType = TOKEN_NEWLINE;
+static int holdingToken;
+
+static int statementType[MAX_STATEMENT_TOKENS];
+static int statementLine[MAX_STATEMENT_TOKENS];
+static char statementLexeme[MAX_STATEMENT_TOKENS][LEXEME_MAX];
+static int statementLength;
+static int statementPosition;
 
 static int tokenType;
 static int tokenLine;
@@ -190,24 +188,16 @@ static int nodeNextSibling[MAX_NODES];
 static int nodeCount;
 static int treeFull;
 
-static char variableName[MAX_VARIABLES][NAME_MAX];
-static int variableType[MAX_VARIABLES];
-static int variableCount;
-
 static int errorLine[MAX_ERRORS];
 static char errorText[MAX_ERRORS][MESSAGE_MAX];
 static int errorCount;
-static int lexicalErrorCount;
-static int pendingLine[MAX_ERRORS];
-static char pendingText[MAX_ERRORS][MESSAGE_MAX];
-static int pendingCount;
 static int panicMode;
 static int afterRecovery;
 static int offendingIsName;
 static int missingBraceReported;
 
 static int parseStatement(int parent);
-static int parseExpression(int parent);
+static void parseExpression(int parent);
 
 static int tokenFromName(const char *name) {
     int type;
@@ -233,13 +223,13 @@ static const char *findLexeme(const char *row) {
     return row;
 }
 
-static void copyLexeme(const char *start) {
+static void copyLexeme(char *destination, const char *source) {
     int length = 0;
-    while (start[length] != '\0' && start[length] != '\n' && start[length] != '\r' && length < LEXEME_MAX - 1) {
-        lexeme[length] = start[length];
+    while (source[length] != '\0' && source[length] != '\n' && source[length] != '\r' && length < LEXEME_MAX - 1) {
+        destination[length] = source[length];
         length++;
     }
-    lexeme[length] = '\0';
+    destination[length] = '\0';
 }
 
 static void readRow(void) {
@@ -261,16 +251,13 @@ static void readRow(void) {
         if (type < 0) {
             continue;
         }
-        if (type == TOKEN_ERROR) {
-            lexicalErrorCount++;
-        }
-        tokenType = type;
-        tokenLine = line;
-        copyLexeme(findLexeme(row));
+        readType = type;
+        readLine = line;
+        copyLexeme(readLexeme, findLexeme(row));
         return;
     }
-    tokenType = TOKEN_END_OF_FILE;
-    lexeme[0] = '\0';
+    readType = TOKEN_END_OF_FILE;
+    readLexeme[0] = '\0';
 }
 
 static int isDiscarded(int type) {
@@ -280,13 +267,129 @@ static int isDiscarded(int type) {
         || (type >= TOKEN_NOISE_WORD_LET && type <= TOKEN_NOISE_WORD_USING);
 }
 
-static void getToken(void) {
-    int previousType = tokenType;
-    strcpy(previousLexeme, lexeme);
+static void readToken(void) {
+    if (holdingToken) {
+        holdingToken = 0;
+        return;
+    }
     do {
         readRow();
-    } while (isDiscarded(tokenType)
-             || (tokenType == TOKEN_NEWLINE && (groupDepth > 0 || previousType == TOKEN_NEWLINE)));
+    } while (isDiscarded(readType) || (readType == TOKEN_NEWLINE && lastReadType == TOKEN_NEWLINE));
+    lastReadType = readType;
+}
+
+static void holdToken(void) {
+    holdingToken = 1;
+}
+
+static void addToStatement(void) {
+    if (statementLength >= MAX_STATEMENT_TOKENS) {
+        return;
+    }
+    statementType[statementLength] = readType;
+    statementLine[statementLength] = readLine;
+    strcpy(statementLexeme[statementLength], readLexeme);
+    statementLength++;
+}
+
+static int isStatementKeyword(int type) {
+    return (type >= TOKEN_KEYWORD_INTEGER && type <= TOKEN_KEYWORD_IF) || type == TOKEN_KEYWORD_WHILE;
+}
+
+static void collectStatement(void) {
+    int groups = 0;
+    int braces = 0;
+    int isIf;
+    int isBlockStatement;
+    int waitingForBlock;
+    statementLength = 0;
+    statementPosition = 0;
+    do {
+        readToken();
+    } while (readType == TOKEN_NEWLINE);
+    addToStatement();
+    if (readType == TOKEN_END_OF_FILE) {
+        return;
+    }
+    isIf = readType == TOKEN_KEYWORD_IF;
+    isBlockStatement = isIf || readType == TOKEN_KEYWORD_WHILE;
+    waitingForBlock = isBlockStatement;
+    for (;;) {
+        readToken();
+        if (readType == TOKEN_END_OF_FILE) {
+            addToStatement();
+            return;
+        }
+        if (readType == TOKEN_NEWLINE && groups > 0) {
+            addToStatement();
+            readToken();
+            holdToken();
+            if (!isStatementKeyword(readType)) {
+                continue;
+            }
+            groups = 0;
+            if (!isBlockStatement || (braces == 0 && !waitingForBlock)) {
+                return;
+            }
+            continue;
+        }
+        if (readType == TOKEN_NEWLINE) {
+            addToStatement();
+            if (!isBlockStatement) {
+                return;
+            }
+            if (braces > 0) {
+                continue;
+            }
+            readToken();
+            holdToken();
+            if (waitingForBlock && readType == TOKEN_LEFT_BRACE) {
+                continue;
+            }
+            return;
+        }
+        addToStatement();
+        if (readType == TOKEN_LEFT_PARENTHESIS || readType == TOKEN_LEFT_BRACKET) {
+            groups++;
+        } else if ((readType == TOKEN_RIGHT_PARENTHESIS || readType == TOKEN_RIGHT_BRACKET) && groups > 0) {
+            groups--;
+        } else if (isBlockStatement && readType == TOKEN_LEFT_BRACE) {
+            braces++;
+            waitingForBlock = 0;
+        } else if (isBlockStatement && readType == TOKEN_RIGHT_BRACE && braces > 0) {
+            braces--;
+            if (braces > 0) {
+                continue;
+            }
+            readToken();
+            if (readType == TOKEN_NEWLINE) {
+                addToStatement();
+                readToken();
+            }
+            if (isIf && (readType == TOKEN_KEYWORD_ELIF || readType == TOKEN_KEYWORD_ELSE)) {
+                addToStatement();
+                waitingForBlock = 1;
+                continue;
+            }
+            holdToken();
+            return;
+        }
+    }
+}
+
+static void getToken(void) {
+    strcpy(previousLexeme, lexeme);
+    do {
+        if (statementPosition < statementLength) {
+            tokenType = statementType[statementPosition];
+            tokenLine = statementLine[statementPosition];
+            strcpy(lexeme, statementLexeme[statementPosition]);
+            statementPosition++;
+        } else {
+            tokenType = TOKEN_END_OF_FILE;
+            lexeme[0] = '\0';
+        }
+    } while (tokenType == TOKEN_NEWLINE && groupDepth > 0);
 }
 
 static int addNode(int parent, const char *label, int token) {
@@ -310,15 +413,6 @@ static int addNode(int parent, const char *label, int token) {
         nodeLastChild[parent] = node;
     }
     return node;
-}
-
-static void appendLabel(int node, const char *text) {
-    size_t used;
-    if (node < 0) {
-        return;
-    }
-    used = strlen(nodeLabel[node]);
-    snprintf(nodeLabel[node] + used, LABEL_MAX - used, "%s", text);
 }
 
 static int matchToken(int parent) {
@@ -373,127 +467,8 @@ static void reservedWordError(void) {
     syntaxError("'%s' is a reserved word and cannot be a variable name.", lexeme);
 }
 
-static void semanticError(int line, const char *format, ...) {
-    va_list arguments;
-    if (panicMode || pendingCount >= MAX_ERRORS) {
-        return;
-    }
-    va_start(arguments, format);
-    vsnprintf(pendingText[pendingCount], MESSAGE_MAX, format, arguments);
-    va_end(arguments);
-    pendingLine[pendingCount] = line;
-    pendingCount++;
-}
-
-static void keepPendingErrors(int mark) {
-    int i;
-    if (!panicMode) {
-        for (i = mark; i < pendingCount; i++) {
-            addError(pendingLine[i], pendingText[i]);
-        }
-    }
-    pendingCount = mark;
-}
-
-static int findVariable(const char *name) {
-    int i;
-    for (i = 0; i < variableCount; i++) {
-        if (strcmp(variableName[i], name) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void declareVariable(const char *name, int type) {
-    int index = findVariable(name);
-    if (index < 0) {
-        if (variableCount >= MAX_VARIABLES) {
-            return;
-        }
-        index = variableCount++;
-        snprintf(variableName[index], NAME_MAX, "%s", name);
-    }
-    variableType[index] = type;
-}
-
-static int lookupVariable(int leaf, const char *name, int line) {
-    char note[NAME_MAX];
-    int index = findVariable(name);
-    if (index < 0) {
-        semanticError(line, "variable '%s' is not declared.", name);
-        appendLabel(leaf, "  (not declared)");
-        return TYPE_UNKNOWN;
-    }
-    snprintf(note, NAME_MAX, "  (%s, declared)", typeName[variableType[index]]);
-    appendLabel(leaf, note);
-    return variableType[index];
-}
-
-static int isNumber(int type) {
-    return type == TYPE_INTEGER || type == TYPE_DECIMAL || type == TYPE_NUMBER;
-}
-
-static int canAssign(int target, int value) {
-    if (target == TYPE_UNKNOWN || value == TYPE_UNKNOWN || target == value) {
-        return 1;
-    }
-    if (target == TYPE_DECIMAL && (value == TYPE_INTEGER || value == TYPE_NUMBER)) {
-        return 1;
-    }
-    if (target == TYPE_INTEGER && value == TYPE_NUMBER) {
-        return 1;
-    }
-    return 0;
-}
-
-static void checkBoolean(int type, const char *word, int line) {
-    if (type != TYPE_UNKNOWN && type != TYPE_BOOLEAN) {
-        semanticError(line, "'%s' needs boolean values, found %s.", word, typeName[type]);
-    }
-}
-
-static int checkNumeric(int type, const char *operatorText, int line) {
-    if (type == TYPE_UNKNOWN) {
-        return 0;
-    }
-    if (!isNumber(type) && type != TYPE_VECTOR) {
-        semanticError(line, "'%s' needs numbers or vectors, found %s.", operatorText, typeName[type]);
-        return 0;
-    }
-    return 1;
-}
-
-static int arithmeticType(int left, int right, int operatorToken, const char *operatorText, int line) {
-    int leftIsGood = checkNumeric(left, operatorText, line);
-    int rightIsGood = checkNumeric(right, operatorText, line);
-    if (!leftIsGood || !rightIsGood) {
-        return TYPE_UNKNOWN;
-    }
-    if (left == TYPE_VECTOR || right == TYPE_VECTOR) {
-        return TYPE_VECTOR;
-    }
-    if (operatorToken == TOKEN_DIVIDE) {
-        return TYPE_DECIMAL;
-    }
-    if (operatorToken == TOKEN_FLOOR_DIVIDE) {
-        return TYPE_INTEGER;
-    }
-    if (left == TYPE_INTEGER && right == TYPE_INTEGER) {
-        return TYPE_INTEGER;
-    }
-    if (left == TYPE_DECIMAL || right == TYPE_DECIMAL) {
-        return TYPE_DECIMAL;
-    }
-    return TYPE_NUMBER;
-}
-
 static int isReservedWord(int type) {
     return type >= TOKEN_KEYWORD_INTEGER && type <= TOKEN_FUNCTION_VARIANCE;
-}
-
-static int isStatementKeyword(int type) {
-    return (type >= TOKEN_KEYWORD_INTEGER && type <= TOKEN_KEYWORD_IF) || type == TOKEN_KEYWORD_WHILE;
 }
 
 static int isAssignOperator(int type) {
@@ -517,17 +492,6 @@ static const char *literalName(int type) {
     case TOKEN_KEYWORD_TRUE: return "boolean literal";
     case TOKEN_KEYWORD_FALSE: return "boolean literal";
     default: return NULL;
-    }
-}
-
-static int declaredType(int keyword) {
-    switch (keyword) {
-    case TOKEN_KEYWORD_INTEGER: return TYPE_INTEGER;
-    case TOKEN_KEYWORD_DECIMAL: return TYPE_DECIMAL;
-    case TOKEN_KEYWORD_CHARACTER: return TYPE_CHARACTER;
-    case TOKEN_KEYWORD_STRING: return TYPE_STRING;
-    case TOKEN_KEYWORD_BOOLEAN: return TYPE_BOOLEAN;
-    default: return TYPE_VECTOR;
     }
 }
 
@@ -574,291 +538,185 @@ static void skipOptionalNewline(int parent) {
     }
 }
 
-static void checkIndex(int type, int line) {
-    if (type != TYPE_UNKNOWN && type != TYPE_INTEGER && type != TYPE_NUMBER) {
-        semanticError(line, "an index must be an integer, found %s.", typeName[type]);
-    }
-}
-
-static int parseIndexing(int parent, const char *name, int type, int line) {
+static void parseIndex(int parent) {
     int index;
-    int wholeOrSlice = 1;
     matchToken(parent);
     if (tokenType != TOKEN_RIGHT_BRACKET) {
         index = addNode(parent, "<index>", -1);
-        checkIndex(parseExpression(index), line);
-        wholeOrSlice = 0;
+        parseExpression(index);
         if (!panicMode && tokenType == TOKEN_COLON) {
             matchToken(index);
-            checkIndex(parseExpression(index), line);
-            wholeOrSlice = 1;
+            parseExpression(index);
         }
         if (panicMode) {
-            return TYPE_UNKNOWN;
+            return;
         }
     }
     if (tokenType != TOKEN_RIGHT_BRACKET) {
         syntaxError("']' expected to close the index.");
-        return TYPE_UNKNOWN;
+        return;
     }
     matchToken(parent);
-    if (type != TYPE_VECTOR && type != TYPE_UNKNOWN) {
-        semanticError(line, "'%s' is a %s, not a vector, so it cannot be indexed.", name, typeName[type]);
-        return TYPE_UNKNOWN;
-    }
-    return wholeOrSlice ? TYPE_VECTOR : TYPE_NUMBER;
 }
 
-static int parseVariableUse(int parent) {
-    char name[NAME_MAX];
-    int line = tokenLine;
-    int leaf;
-    int type;
-    snprintf(name, NAME_MAX, "%.63s", lexeme);
-    leaf = matchToken(parent);
-    type = lookupVariable(leaf, name, line);
-    if (tokenType != TOKEN_LEFT_BRACKET) {
-        return type;
-    }
-    return parseIndexing(parent, name, type, line);
-}
-
-static void parseVectorValue(int parent) {
-    int line = tokenLine;
-    int type = parseExpression(parent);
-    if (type != TYPE_UNKNOWN && !isNumber(type)) {
-        semanticError(line, "a vector can only hold numbers, found %s.", typeName[type]);
-    }
-}
-
-static int parseVectorLiteral(int parent) {
+static void parseVectorLiteral(int parent) {
     int node = addNode(parent, "<vector_lit>", -1);
     matchToken(node);
     if (tokenType == TOKEN_RIGHT_BRACKET) {
         matchToken(node);
-        return TYPE_VECTOR;
+        return;
     }
-    parseVectorValue(node);
+    parseExpression(node);
     while (!panicMode && tokenType == TOKEN_COMMA) {
         matchToken(node);
-        parseVectorValue(node);
+        parseExpression(node);
     }
     if (panicMode) {
-        return TYPE_UNKNOWN;
+        return;
     }
     if (tokenType != TOKEN_RIGHT_BRACKET) {
         syntaxError("']' expected to close the vector.");
-        return TYPE_UNKNOWN;
+        return;
     }
     matchToken(node);
-    return TYPE_VECTOR;
 }
 
-static int parseFunctionCall(int parent) {
+static void parseFunctionCall(int parent) {
     int node = addNode(parent, "<func_call>", -1);
-    int function = tokenType;
-    int line = tokenLine;
-    int argument;
     char name[NAME_MAX];
     snprintf(name, NAME_MAX, "%.63s", lexeme);
     matchToken(node);
     if (tokenType != TOKEN_LEFT_PARENTHESIS) {
         syntaxError("'(' expected after '%s'.", name);
-        return TYPE_UNKNOWN;
+        return;
     }
     matchToken(node);
-    argument = parseExpression(node);
+    parseExpression(node);
     if (panicMode) {
-        return TYPE_UNKNOWN;
+        return;
     }
     if (tokenType != TOKEN_RIGHT_PARENTHESIS) {
         syntaxError("')' expected to close '%s'.", name);
-        return TYPE_UNKNOWN;
+        return;
     }
     matchToken(node);
-    if (argument != TYPE_VECTOR && argument != TYPE_UNKNOWN) {
-        semanticError(line, "'%s' needs a vector, found %s.", name, typeName[argument]);
-    }
-    return function == TOKEN_FUNCTION_MODE ? TYPE_NUMBER : TYPE_DECIMAL;
 }
 
-static int parsePrimary(int parent) {
+static void parsePrimary(int parent) {
     int node = addNode(parent, "<primary>", -1);
-    int type;
     switch (tokenType) {
     case TOKEN_INTEGER_LITERAL:
-        matchToken(node);
-        return TYPE_INTEGER;
     case TOKEN_DECIMAL_LITERAL:
-        matchToken(node);
-        return TYPE_DECIMAL;
     case TOKEN_CHARACTER_LITERAL:
-        matchToken(node);
-        return TYPE_CHARACTER;
     case TOKEN_STRING_LITERAL:
-        matchToken(node);
-        return TYPE_STRING;
     case TOKEN_KEYWORD_TRUE:
     case TOKEN_KEYWORD_FALSE:
         matchToken(node);
-        return TYPE_BOOLEAN;
+        return;
     case TOKEN_IDENTIFIER:
-        return parseVariableUse(node);
+        matchToken(node);
+        if (tokenType == TOKEN_LEFT_BRACKET) {
+            parseIndex(node);
+        }
+        return;
     case TOKEN_LEFT_PARENTHESIS:
         matchToken(node);
-        type = parseExpression(node);
+        parseExpression(node);
         if (panicMode) {
-            return TYPE_UNKNOWN;
+            return;
         }
         if (tokenType != TOKEN_RIGHT_PARENTHESIS) {
             syntaxError("')' expected to close the expression.");
-            return TYPE_UNKNOWN;
+            return;
         }
         matchToken(node);
-        return type;
+        return;
     case TOKEN_LEFT_BRACKET:
-        return parseVectorLiteral(node);
+        parseVectorLiteral(node);
+        return;
     case TOKEN_FUNCTION_MEAN:
     case TOKEN_FUNCTION_MEDIAN:
     case TOKEN_FUNCTION_MODE:
     case TOKEN_FUNCTION_VARIANCE:
-        return parseFunctionCall(node);
+        parseFunctionCall(node);
+        return;
     default:
         if (isReservedWord(tokenType)) {
             reservedWordError();
         } else {
             syntaxError("expression expected after '%s'.", previousLexeme);
         }
-        return TYPE_UNKNOWN;
+        return;
     }
 }
 
-static int parsePower(int parent) {
+static void parsePower(int parent) {
     int node = addNode(parent, "<power>", -1);
-    int type = parsePrimary(node);
-    int line;
+    parsePrimary(node);
     if (!panicMode && tokenType == TOKEN_EXPONENT) {
-        line = tokenLine;
         matchToken(node);
-        type = arithmeticType(type, parsePower(node), TOKEN_EXPONENT, "^", line);
+        parsePower(node);
     }
-    return type;
 }
 
-static int parseUnary(int parent) {
+static void parseUnary(int parent) {
     int node = addNode(parent, "<unary>", -1);
-    int operatorToken = tokenType;
-    int line = tokenLine;
-    int type;
-    if (operatorToken != TOKEN_KEYWORD_NOT && operatorToken != TOKEN_MINUS) {
-        return parsePower(node);
+    if (tokenType == TOKEN_KEYWORD_NOT || tokenType == TOKEN_MINUS) {
+        matchToken(node);
+        parseUnary(node);
+        return;
     }
-    matchToken(node);
-    type = parseUnary(node);
-    if (operatorToken == TOKEN_KEYWORD_NOT) {
-        checkBoolean(type, "not", line);
-        return TYPE_BOOLEAN;
-    }
-    return checkNumeric(type, "-", line) ? type : TYPE_UNKNOWN;
+    parsePower(node);
 }
 
-static int isMultiplyOperator(int type) {
-    return type >= TOKEN_MULTIPLY && type <= TOKEN_MODULO;
-}
-
-static int parseMultiplicative(int parent) {
+static void parseMultiplicative(int parent) {
     int node = addNode(parent, "<mul_expr>", -1);
-    int type = parseUnary(node);
-    int operatorToken;
-    int line;
-    char operatorText[8];
-    while (!panicMode && isMultiplyOperator(tokenType)) {
-        operatorToken = tokenType;
-        line = tokenLine;
-        snprintf(operatorText, sizeof operatorText, "%.7s", lexeme);
+    parseUnary(node);
+    while (!panicMode && tokenType >= TOKEN_MULTIPLY && tokenType <= TOKEN_MODULO) {
         matchToken(node);
-        type = arithmeticType(type, parseUnary(node), operatorToken, operatorText, line);
+        parseUnary(node);
     }
-    return type;
 }
 
-static int parseAdditive(int parent) {
+static void parseAdditive(int parent) {
     int node = addNode(parent, "<add_expr>", -1);
-    int type = parseMultiplicative(node);
-    int operatorToken;
-    int line;
-    char operatorText[8];
+    parseMultiplicative(node);
     while (!panicMode && (tokenType == TOKEN_PLUS || tokenType == TOKEN_MINUS)) {
-        operatorToken = tokenType;
-        line = tokenLine;
-        snprintf(operatorText, sizeof operatorText, "%.7s", lexeme);
         matchToken(node);
-        type = arithmeticType(type, parseMultiplicative(node), operatorToken, operatorText, line);
+        parseMultiplicative(node);
     }
-    return type;
 }
 
-static int isRelationalOperator(int type) {
-    return type >= TOKEN_EQUAL && type <= TOKEN_GREATER_THAN_OR_EQUAL;
-}
-
-static int parseRelational(int parent) {
+static void parseRelational(int parent) {
     int node = addNode(parent, "<rel_expr>", -1);
-    int type = parseAdditive(node);
-    int right;
-    int operatorToken;
-    int line;
-    char operatorText[8];
-    while (!panicMode && isRelationalOperator(tokenType)) {
-        operatorToken = tokenType;
-        line = tokenLine;
-        snprintf(operatorText, sizeof operatorText, "%.7s", lexeme);
+    parseAdditive(node);
+    while (!panicMode && tokenType >= TOKEN_EQUAL && tokenType <= TOKEN_GREATER_THAN_OR_EQUAL) {
         matchToken(node);
-        right = parseAdditive(node);
-        if (operatorToken != TOKEN_EQUAL && operatorToken != TOKEN_NOT_EQUAL) {
-            if (type != TYPE_UNKNOWN && !isNumber(type)) {
-                semanticError(line, "'%s' needs numbers, found %s.", operatorText, typeName[type]);
-            }
-            if (right != TYPE_UNKNOWN && !isNumber(right)) {
-                semanticError(line, "'%s' needs numbers, found %s.", operatorText, typeName[right]);
-            }
-        }
-        type = TYPE_BOOLEAN;
+        parseAdditive(node);
     }
-    return type;
 }
 
-static int parseAnd(int parent) {
+static void parseAnd(int parent) {
     int node = addNode(parent, "<and_expr>", -1);
-    int type = parseRelational(node);
-    int line;
+    parseRelational(node);
     while (!panicMode && tokenType == TOKEN_KEYWORD_AND) {
-        line = tokenLine;
         matchToken(node);
-        checkBoolean(type, "and", line);
-        checkBoolean(parseRelational(node), "and", line);
-        type = TYPE_BOOLEAN;
+        parseRelational(node);
     }
-    return type;
 }
 
-static int parseOr(int parent) {
+static void parseOr(int parent) {
     int node = addNode(parent, "<or_expr>", -1);
-    int type = parseAnd(node);
-    int line;
+    parseAnd(node);
     while (!panicMode && tokenType == TOKEN_KEYWORD_OR) {
-        line = tokenLine;
         matchToken(node);
-        checkBoolean(type, "or", line);
-        checkBoolean(parseAnd(node), "or", line);
-        type = TYPE_BOOLEAN;
+        parseAnd(node);
     }
-    return type;
 }
 
-static int parseExpression(int parent) {
+static void parseExpression(int parent) {
     int node = addNode(parent, "<expression>", -1);
-    return parseOr(node);
+    parseOr(node);
 }
 
 static void skipToBlock(void) {
@@ -871,30 +729,15 @@ static void skipToBlock(void) {
     afterRecovery = 1;
 }
 
-static void parseCondition(int parent, const char *keyword, int isLoop) {
-    int mark = pendingCount;
-    int line = tokenLine;
-    int node;
-    int type;
+static void parseCondition(int parent, const char *keyword) {
     if (!startsExpression(tokenType)) {
         syntaxError("condition expected after '%s'.", keyword);
     } else {
-        node = addNode(parent, "<condition>", -1);
-        type = parseExpression(node);
-        if (!panicMode && type != TYPE_BOOLEAN && type != TYPE_UNKNOWN) {
-            if (isLoop) {
-                semanticError(line, "loop condition must be boolean, found %s.", typeName[type]);
-            } else {
-                semanticError(line, "condition of '%s' must be boolean, found %s.", keyword, typeName[type]);
-            }
-        }
+        parseExpression(addNode(parent, "<condition>", -1));
     }
     if (panicMode) {
-        pendingCount = mark;
         skipToBlock();
-        return;
     }
-    keepPendingErrors(mark);
 }
 
 static void parseBlock(int parent, const char *name) {
@@ -928,7 +771,7 @@ static void parseIf(int parent) {
     int sawNewline;
     int sawElse = 0;
     matchToken(node);
-    parseCondition(node, "if", 0);
+    parseCondition(node, "if");
     skipOptionalNewline(node);
     parseBlock(node, "if body");
     while (!panicMode) {
@@ -954,7 +797,7 @@ static void parseIf(int parent) {
             parseBlock(node, "else body");
         } else {
             matchToken(node);
-            parseCondition(node, "elif", 0);
+            parseCondition(node, "elif");
             skipOptionalNewline(node);
             parseBlock(node, "elif body");
         }
@@ -964,7 +807,7 @@ static void parseIf(int parent) {
 static void parseWhile(int parent) {
     int node = addNode(parent, "<while_stmt>", -1);
     matchToken(node);
-    parseCondition(node, "while", 1);
+    parseCondition(node, "while");
     skipOptionalNewline(node);
     parseBlock(node, "loop body");
     if (panicMode) {
@@ -975,11 +818,6 @@ static void parseWhile(int parent) {
 
 static void parseInput(int parent) {
     int node = addNode(parent, "<input_stmt>", -1);
-    int mark = pendingCount;
-    int line;
-    int leaf;
-    int type;
-    char name[NAME_MAX];
     matchToken(node);
     if (tokenType != TOKEN_LEFT_PARENTHESIS) {
         syntaxError("'(' expected after 'input'.");
@@ -996,23 +834,13 @@ static void parseInput(int parent) {
         }
         return;
     }
-    line = tokenLine;
-    snprintf(name, NAME_MAX, "%.63s", lexeme);
-    leaf = matchToken(node);
+    matchToken(node);
     if (tokenType != TOKEN_RIGHT_PARENTHESIS) {
         syntaxError("')' expected to close 'input'.");
         return;
     }
     matchToken(node);
     parseTerminator(node, 1);
-    if (panicMode) {
-        return;
-    }
-    type = lookupVariable(leaf, name, line);
-    if (type == TYPE_VECTOR) {
-        semanticError(line, "cannot read input into vector '%s'.", name);
-    }
-    keepPendingErrors(mark);
 }
 
 static int singleLeaf(int node) {
@@ -1068,8 +896,6 @@ static void nameOutputForm(int list) {
 
 static void parsePrint(int parent) {
     int node = addNode(parent, "<output_stmt>", -1);
-    int mark = pendingCount;
-    int content;
     int list;
     matchToken(node);
     if (tokenType != TOKEN_LEFT_PARENTHESIS) {
@@ -1081,8 +907,7 @@ static void parsePrint(int parent) {
         syntaxError("output content expected inside 'print( )'.");
         return;
     }
-    content = addNode(node, "<output_content>", -1);
-    list = addNode(content, "<output_list>", -1);
+    list = addNode(addNode(node, "<output_content>", -1), "<output_list>", -1);
     parseExpression(list);
     while (!panicMode && tokenType == TOKEN_COMMA) {
         matchToken(list);
@@ -1101,62 +926,31 @@ static void parsePrint(int parent) {
     }
     matchToken(node);
     parseTerminator(node, 1);
-    if (panicMode) {
-        return;
+    if (!panicMode) {
+        nameOutputForm(list);
     }
-    nameOutputForm(list);
-    keepPendingErrors(mark);
 }
 
 static void parseAssignment(int parent) {
     int node = addNode(parent, "<assignment>", -1);
-    int mark = pendingCount;
-    int line = tokenLine;
-    int target;
-    int value;
-    int operatorToken;
-    int leaf;
     char name[NAME_MAX];
-    char operatorText[8];
     snprintf(name, NAME_MAX, "%.63s", lexeme);
-    leaf = matchToken(node);
-    target = lookupVariable(leaf, name, line);
+    matchToken(node);
     if (!isAssignOperator(tokenType)) {
         syntaxError("assignment operator expected after '%s'.", name);
         return;
     }
-    operatorToken = tokenType;
-    snprintf(operatorText, sizeof operatorText, "%.7s", lexeme);
     matchToken(addNode(node, "<assign_op>", -1));
-    value = parseExpression(node);
+    parseExpression(node);
     if (panicMode) {
         return;
     }
     parseTerminator(node, 0);
-    if (panicMode) {
-        return;
-    }
-    if (operatorToken != TOKEN_ASSIGN) {
-        int result = operatorToken == TOKEN_DIVIDE_ASSIGN ? TYPE_DECIMAL : value;
-        if (target != TYPE_UNKNOWN && target != TYPE_INTEGER && target != TYPE_DECIMAL && target != TYPE_VECTOR) {
-            semanticError(line, "'%s' needs an integer, decimal, or vector variable, found %s '%s'.",
-                          operatorText, typeName[target], name);
-        } else if (checkNumeric(value, operatorText, line) && target != TYPE_VECTOR && !canAssign(target, result)) {
-            semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[result], typeName[target], name);
-        }
-    } else if (!canAssign(target, value)) {
-        semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[value], typeName[target], name);
-    }
-    keepPendingErrors(mark);
 }
 
-static void parseDeclarator(int parent, int type) {
+static void parseDeclarator(int parent) {
     int node = addNode(parent, "<declarator>", -1);
-    int line;
-    int leaf;
-    int value;
     char name[NAME_MAX];
-    char note[NAME_MAX];
     if (tokenType != TOKEN_IDENTIFIER) {
         if (isReservedWord(tokenType)) {
             reservedWordError();
@@ -1165,43 +959,30 @@ static void parseDeclarator(int parent, int type) {
         }
         return;
     }
-    line = tokenLine;
     snprintf(name, NAME_MAX, "%.63s", lexeme);
-    leaf = matchToken(node);
+    matchToken(node);
     if (tokenType == TOKEN_ASSIGN) {
         matchToken(node);
-        value = parseExpression(node);
-        if (!panicMode && !canAssign(type, value)) {
-            semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[value], typeName[type], name);
-        }
+        parseExpression(node);
     } else if (isAssignOperator(tokenType)) {
         syntaxError("'%s' cannot be used in a declaration, use '='.", lexeme);
     } else if (tokenType != TOKEN_COMMA && tokenType != TOKEN_NEWLINE && tokenType != TOKEN_END_OF_FILE) {
         syntaxError("',', '=' or end of line expected after '%s'.", name);
     }
-    declareVariable(name, type);
-    snprintf(note, NAME_MAX, "  (declared as %s)", typeName[type]);
-    appendLabel(leaf, note);
 }
 
 static void parseDeclaration(int parent) {
     int node = addNode(parent, "<declaration>", -1);
-    int mark = pendingCount;
-    int type = declaredType(tokenType);
     matchToken(addNode(node, "<data_type>", -1));
-    parseDeclarator(node, type);
+    parseDeclarator(node);
     while (!panicMode && tokenType == TOKEN_COMMA) {
         matchToken(node);
-        parseDeclarator(node, type);
+        parseDeclarator(node);
     }
     if (panicMode) {
         return;
     }
     parseTerminator(node, 0);
-    if (panicMode) {
-        return;
-    }
-    keepPendingErrors(mark);
 }
 
 static void reportBadStatementStart(void) {
@@ -1218,7 +999,6 @@ static void reportBadStatementStart(void) {
 
 static int parseStatement(int parent) {
     int node = addNode(parent, "<statement>", -1);
-    int mark = pendingCount;
     switch (tokenType) {
     case TOKEN_KEYWORD_INTEGER:
     case TOKEN_KEYWORD_DECIMAL:
@@ -1248,7 +1028,6 @@ static int parseStatement(int parent) {
         break;
     }
     if (panicMode) {
-        pendingCount = mark;
         addNode(node, "<syntax error: rest of the statement is skipped>", -1);
         recoverFromError();
     }
@@ -1261,21 +1040,46 @@ static void output(const char *text) {
 }
 
 static void printTree(int node, const char *prefix, int isLast) {
-    char line[LINE_MAX];
+    char line[TREE_LINE_MAX];
     char childPrefix[PREFIX_MAX];
     size_t used;
     int child;
-    snprintf(line, LINE_MAX, "%s%s%s", prefix, isLast ? "`-- " : "|-- ", nodeLabel[node]);
+    snprintf(line, TREE_LINE_MAX, "%s%s%s", prefix, isLast ? TREE_LAST : TREE_BRANCH, nodeLabel[node]);
     while (nodeToken[node] < 0 && nodeFirstChild[node] >= 0 && nodeNextSibling[nodeFirstChild[node]] < 0) {
         node = nodeFirstChild[node];
         used = strlen(line);
-        snprintf(line + used, LINE_MAX - used, " -> %s", nodeLabel[node]);
+        snprintf(line + used, TREE_LINE_MAX - used, "%s%s", TREE_ARROW, nodeLabel[node]);
     }
     output(line);
     output("\n");
-    snprintf(childPrefix, PREFIX_MAX, "%.1000s%s", prefix, isLast ? "    " : "|   ");
+    snprintf(childPrefix, PREFIX_MAX, "%.1000s%s", prefix, isLast ? TREE_SPACE : TREE_PIPE);
     for (child = nodeFirstChild[node]; child >= 0; child = nodeNextSibling[child]) {
         printTree(child, childPrefix, nodeNextSibling[child] < 0);
+    }
+}
+
+static void parseCollectedStatement(void) {
+    int root;
+    afterRecovery = 0;
+    getToken();
+    while (tokenType != TOKEN_END_OF_FILE) {
+        if (tokenType == TOKEN_NEWLINE) {
+            getToken();
+            continue;
+        }
+        if (tokenType == TOKEN_RIGHT_BRACE) {
+            syntaxError("unexpected '}' with no matching '{'.");
+            panicMode = 0;
+            getToken();
+            continue;
+        }
+        nodeCount = 0;
+        treeFull = 0;
+        root = parseStatement(-1);
+        printTree(root, "", 0);
+        if (treeFull) {
+            output(TREE_PIPE "(this statement is too large, some nodes are not shown)\n");
+        }
     }
 }
 
@@ -1310,9 +1114,11 @@ static void makeParseTreePath(const char *tablePath, char *treePath, size_t size
 int main(int argc, char *argv[]) {
     char treePath[PATH_MAX_LENGTH];
     char message[MESSAGE_MAX + 64];
-    int root;
     int i;
 
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);
+#endif
     if (argc < 2) {
         printf("Usage: %s \"Symbol Table.txt\"\n", argv[0]);
         return 1;
@@ -1330,40 +1136,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    getToken();
     output("<program>\n");
-    while (tokenType != TOKEN_END_OF_FILE) {
-        if (tokenType == TOKEN_NEWLINE) {
-            getToken();
-            continue;
+    for (;;) {
+        collectStatement();
+        if (statementType[0] == TOKEN_END_OF_FILE) {
+            break;
         }
-        if (tokenType == TOKEN_RIGHT_BRACE) {
-            syntaxError("unexpected '}' with no matching '{'.");
-            panicMode = 0;
-            getToken();
-            continue;
-        }
-        nodeCount = 0;
-        treeFull = 0;
-        root = parseStatement(-1);
-        printTree(root, "", 0);
-        if (treeFull) {
-            output("|   (this statement is too large, some nodes are not shown)\n");
-        }
+        parseCollectedStatement();
     }
-    output("`-- EOF\n\n");
+    output(TREE_LAST "EOF\n\n");
 
     sortErrorsByLine();
     for (i = 0; i < errorCount; i++) {
         snprintf(message, sizeof message, "Syntax error on line %d: %s\n", errorLine[i], errorText[i]);
         output(message);
     }
-    if (errorCount > 0 && lexicalErrorCount > 0) {
-        snprintf(message, sizeof message, "%d syntax error(s) found, and the lexer reported %d lexical error(s). The program is rejected.\n", errorCount, lexicalErrorCount);
-    } else if (errorCount > 0) {
+    if (errorCount > 0) {
         snprintf(message, sizeof message, "%d syntax error(s) found. The program is rejected.\n", errorCount);
-    } else if (lexicalErrorCount > 0) {
-        snprintf(message, sizeof message, "No syntax error found, but the lexer reported %d lexical error(s). The program is rejected.\n", lexicalErrorCount);
     } else {
         snprintf(message, sizeof message, "No syntax error found. The program is accepted.\n");
     }
@@ -1372,5 +1161,5 @@ int main(int argc, char *argv[]) {
 
     fclose(symbolTable);
     fclose(treeFile);
-    return errorCount > 0 || lexicalErrorCount > 0;
+    return errorCount > 0;
 }
