@@ -1,12 +1,31 @@
+// εpsilon SYNTAX ANALYZER (study copy with comments)
+//
+// What it does, in order (Syntax doc 3.3 "Reading Process"):
+//   1. Reads the Symbol Table that the lexer wrote, ONE row (one token) at a time.
+//   2. Throws away comments, noise words and ERROR rows.
+//   3. Puts the other tokens in a statement buffer until the statement's
+//      terminator: the end of the line, or the closing } of an if / while.
+//   4. Parses that one statement with recursive descent (one function per
+//      grammar rule) and builds its parse tree.
+//   5. Prints the tree. On a syntax error it uses panic mode: report the line,
+//      skip to a safe token, keep going.
+//   6. Clears the buffer and repeats until EOF, then lists all errors.
+// It checks SYNTAX only. Whether a variable is declared or a type fits is the
+// semantic analyzer's job, so this program never looks at that.
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
 
 #ifdef _WIN32
+
+// Windows only: switch the console to UTF-8 so it can show the tree symbols
+// ├── └── │ →. This is the only line that talks to the operating system.
 __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int codePage);
 #endif
 
 enum {
+    // Every token type. Same list and same order as in the lexer, so both programs
+    // agree on what each token is.
     TOKEN_ERROR,
     TOKEN_END_OF_FILE,
     TOKEN_NEWLINE,
@@ -74,6 +93,9 @@ enum {
     TOKEN_TYPE_COUNT
 };
 
+// The name of each token type, exactly as the lexer writes it in the TOKEN
+// column of Symbol Table.txt. Used to turn that text back into a token type,
+// and to print token names in the tree.
 static const char *tokenName[TOKEN_TYPE_COUNT] = {
     [TOKEN_ERROR] = "ERROR",
     [TOKEN_END_OF_FILE] = "EOF",
@@ -141,12 +163,19 @@ static const char *tokenName[TOKEN_TYPE_COUNT] = {
     [TOKEN_COLON] = "COLON"
 };
 
+// The tree drawing symbols (written as UTF-8 bytes):
+//   TREE_BRANCH "├── "   a child that has more children after it
+//   TREE_LAST   "└── "   the last child
+//   TREE_PIPE   "│   "   the line that continues past a child
+//   TREE_ARROW  " → "    "A → B" means B is the ONLY child of A (doc 3.4.5)
 #define TREE_BRANCH "\xE2\x94\x9C\xE2\x94\x80\xE2\x94\x80 "
 #define TREE_LAST "\xE2\x94\x94\xE2\x94\x80\xE2\x94\x80 "
 #define TREE_PIPE "\xE2\x94\x82   "
 #define TREE_SPACE "    "
 #define TREE_ARROW " \xE2\x86\x92 "
 
+// Fixed sizes. Every table below has a fixed size written in the source;
+// nothing is created or grown while the program runs (no malloc).
 #define ROW_MAX 4096
 #define LEXEME_MAX 128
 #define LABEL_MAX 200
@@ -159,27 +188,41 @@ static const char *tokenName[TOKEN_TYPE_COUNT] = {
 #define MESSAGE_MAX 256
 #define PATH_MAX_LENGTH 1024
 
+// symbolTable = the input file (Symbol Table.txt), treeFile = the output
+// file (Parse Tree.txt).
 static FILE *symbolTable;
 static FILE *treeFile;
 
+// The token that was just read from the FILE (one row of the Symbol Table).
+// holdingToken = 1 means "this token was read too early, use it again for the
+// next statement" (see holdToken).
 static int readType;
 static int readLine;
 static char readLexeme[LEXEME_MAX];
 static int lastReadType = TOKEN_NEWLINE;
 static int holdingToken;
 
+// THE STATEMENT BUFFER: the tokens of ONE statement, collected until its
+// terminator. statementPosition is how far the parser has read in it.
 static int statementType[MAX_STATEMENT_TOKENS];
 static int statementLine[MAX_STATEMENT_TOKENS];
 static char statementLexeme[MAX_STATEMENT_TOKENS][LEXEME_MAX];
 static int statementLength;
 static int statementPosition;
 
+// The token the PARSER is looking at right now (the lookahead), taken from
+// the statement buffer. groupDepth counts open ( and [ so a NEWLINE inside
+// them is ignored (doc 3.3 "Open groups").
 static int tokenType;
 static int tokenLine;
 static char lexeme[LEXEME_MAX];
 static char previousLexeme[LEXEME_MAX];
 static int groupDepth;
 
+// THE PARSE TREE of the current statement. Each node has a label (for example
+// "<declaration>" or "IDENT 'x'"), its first child, its last child and its
+// next sibling. nodeToken is -1 for a non-terminal (<...>) and the token type
+// for a leaf. The tree is cleared before every statement.
 static char nodeLabel[MAX_NODES][LABEL_MAX];
 static int nodeToken[MAX_NODES];
 static int nodeFirstChild[MAX_NODES];
@@ -188,6 +231,11 @@ static int nodeNextSibling[MAX_NODES];
 static int nodeCount;
 static int treeFull;
 
+// The syntax errors found so far, printed at the end in line order.
+// panicMode       = an error was found and the parser is recovering
+// afterRecovery   = do not report a second error caused by the same mistake
+// offendingIsName = the error was "reserved word used as a name"
+// missingBraceReported = a missing } at EOF was already reported (only once)
 static int errorLine[MAX_ERRORS];
 static char errorText[MAX_ERRORS][MESSAGE_MAX];
 static int errorCount;
@@ -196,9 +244,14 @@ static int afterRecovery;
 static int offendingIsName;
 static int missingBraceReported;
 
+// These two call each other (a block holds statements, a statement holds
+// expressions), so they are declared before they are defined.
 static int parseStatement(int parent);
 static void parseExpression(int parent);
 
+// Turns the token name read from the file (for example "KW_IF") back into its
+// token type. This only READS the lexer's result; tokens are never decided by
+// comparing lexemes.
 static int tokenFromName(const char *name) {
     int type;
     for (type = 0; type < TOKEN_TYPE_COUNT; type++) {
@@ -209,6 +262,8 @@ static int tokenFromName(const char *name) {
     return -1;
 }
 
+// A row looks like "5     | 12    | IDENT           | name".
+// The lexeme starts after the third '|'. Returns where it starts.
 static const char *findLexeme(const char *row) {
     int bars = 0;
     while (*row != '\0' && bars < 3) {
@@ -223,6 +278,7 @@ static const char *findLexeme(const char *row) {
     return row;
 }
 
+// Copies the lexeme up to the end of the row.
 static void copyLexeme(char *destination, const char *source) {
     int length = 0;
     while (source[length] != '\0' && source[length] != '\n' && source[length] != '\r' && length < LEXEME_MAX - 1) {
@@ -232,6 +288,9 @@ static void copyLexeme(char *destination, const char *source) {
     destination[length] = '\0';
 }
 
+// READS ONE ROW of the Symbol Table: line, column, token name, lexeme.
+// Rows that are not tokens (the header and the dashes) are skipped.
+// At the end of the file the token becomes EOF.
 static void readRow(void) {
     char row[ROW_MAX];
     char name[32];
@@ -260,6 +319,8 @@ static void readRow(void) {
     readLexeme[0] = '\0';
 }
 
+// Tokens the parser ignores (doc 3.3): ERROR (the lexer already reported it),
+// comments, and noise words (let, the, of, from, using).
 static int isDiscarded(int type) {
     return type == TOKEN_ERROR
         || type == TOKEN_LINE_COMMENT
@@ -267,6 +328,10 @@ static int isDiscarded(int type) {
         || (type >= TOKEN_NOISE_WORD_LET && type <= TOKEN_NOISE_WORD_USING);
 }
 
+// Gets the next USEFUL token from the file: reads rows until one is not
+// discarded. A NEWLINE right after another NEWLINE is also skipped, so blank
+// lines and comment-only lines count as one terminator.
+// If a token is being held, it is used instead of reading a new one.
 static void readToken(void) {
     if (holdingToken) {
         holdingToken = 0;
@@ -278,10 +343,13 @@ static void readToken(void) {
     lastReadType = readType;
 }
 
+// Keeps the token that was just read for the NEXT statement. Needed because
+// the only way to know a statement is over is to look at the token after it.
 static void holdToken(void) {
     holdingToken = 1;
 }
 
+// Adds the token that was just read to the statement buffer.
 static void addToStatement(void) {
     if (statementLength >= MAX_STATEMENT_TOKENS) {
         return;
@@ -292,10 +360,20 @@ static void addToStatement(void) {
     statementLength++;
 }
 
+// Tokens that can only START a statement: the six data types, input, print,
+// if, while. (elif and else are not included: they continue an if.)
 static int isStatementKeyword(int type) {
     return (type >= TOKEN_KEYWORD_INTEGER && type <= TOKEN_KEYWORD_IF) || type == TOKEN_KEYWORD_WHILE;
 }
 
+// COLLECTS ONE STATEMENT into the buffer, one token at a time, and stops at
+// its terminator (doc 3.3 "Statement Terminators"):
+//   - declaration, assignment, input, print: the NEWLINE at the end of the
+//     line, unless a ( or [ is still open;
+//   - if / while: the } that closes the block. For an if it also looks at the
+//     next token: elif or else means the statement goes on.
+// groups = open ( and [, braces = open { of this if/while,
+// waitingForBlock = the if/elif/else/while still needs its {.
 static void collectStatement(void) {
     int groups = 0;
     int braces = 0;
@@ -320,6 +398,9 @@ static void collectStatement(void) {
             addToStatement();
             return;
         }
+        // A NEWLINE inside an open ( or [ does not end the statement (a vector can
+        // continue on the next line). Exception: if the next line starts with a
+        // statement keyword, the ( or [ was never closed, so the group is dropped.
         if (readType == TOKEN_NEWLINE && groups > 0) {
             addToStatement();
             readToken();
@@ -333,6 +414,8 @@ static void collectStatement(void) {
             }
             continue;
         }
+        // A normal NEWLINE. It ends a simple statement. Inside a block it is kept.
+        // Before the first { of an if/while it is allowed only when { comes next.
         if (readType == TOKEN_NEWLINE) {
             addToStatement();
             if (!isBlockStatement) {
@@ -356,6 +439,9 @@ static void collectStatement(void) {
         } else if (isBlockStatement && readType == TOKEN_LEFT_BRACE) {
             braces++;
             waitingForBlock = 0;
+        // A } that closes the block of an if/while. When the outermost block closes,
+        // look past one NEWLINE: elif / else continue the if, anything else is held
+        // for the next statement and this statement is complete.
         } else if (isBlockStatement && readType == TOKEN_RIGHT_BRACE && braces > 0) {
             braces--;
             if (braces > 0) {
@@ -377,6 +463,9 @@ static void collectStatement(void) {
     }
 }
 
+// The PARSER's "next token": takes it from the statement buffer (never from
+// the file). When the buffer is used up it returns EOF, so a parse can never
+// run past its own statement. NEWLINEs inside an open ( or [ are skipped.
 static void getToken(void) {
     strcpy(previousLexeme, lexeme);
     do {
@@ -392,6 +481,7 @@ static void getToken(void) {
     } while (tokenType == TOKEN_NEWLINE && groupDepth > 0);
 }
 
+// Adds a node to the parse tree under parent (-1 = it is the root).
 static int addNode(int parent, const char *label, int token) {
     int node;
     if (nodeCount >= MAX_NODES) {
@@ -415,6 +505,9 @@ static int addNode(int parent, const char *label, int token) {
     return node;
 }
 
+// MATCH: the current token is the one the grammar expects, so it becomes a
+// leaf of the tree (for example "KW_IF 'if'") and the parser moves to the next
+// token. Callers check the token type first.
 static int matchToken(int parent) {
     char label[LABEL_MAX];
     int node;
@@ -435,6 +528,7 @@ static int matchToken(int parent) {
     return node;
 }
 
+// Stores one error message with its line number.
 static void addError(int line, const char *message) {
     if (errorCount >= MAX_ERRORS) {
         return;
@@ -444,6 +538,9 @@ static void addError(int line, const char *message) {
     errorCount++;
 }
 
+// REPORTS A SYNTAX ERROR and starts panic mode. Only the first error of a
+// statement is reported; while recovering, more errors are ignored.
+// The line is the line of the token where the error was found.
 static void syntaxError(const char *format, ...) {
     char message[MESSAGE_MAX];
     va_list arguments;
@@ -460,6 +557,8 @@ static void syntaxError(const char *format, ...) {
     addError(tokenLine, message);
 }
 
+// "'while' is a reserved word and cannot be a variable name." The keyword is
+// being used as a name, so recovery skips it too.
 static void reservedWordError(void) {
     if (!panicMode) {
         offendingIsName = 1;
@@ -467,14 +566,18 @@ static void reservedWordError(void) {
     syntaxError("'%s' is a reserved word and cannot be a variable name.", lexeme);
 }
 
+// Keywords, true/false and the four statistical functions (doc 3.4 rule).
 static int isReservedWord(int type) {
     return type >= TOKEN_KEYWORD_INTEGER && type <= TOKEN_FUNCTION_VARIANCE;
 }
 
+// = += -= *= /= %= ^=
 static int isAssignOperator(int type) {
     return type >= TOKEN_ASSIGN && type <= TOKEN_EXPONENT_ASSIGN;
 }
 
+// Tokens that can start an expression: names, literals, not, -, ( , [ and
+// the statistical functions.
 static int startsExpression(int type) {
     return (type >= TOKEN_IDENTIFIER && type <= TOKEN_STRING_LITERAL)
         || (type >= TOKEN_KEYWORD_NOT && type <= TOKEN_FUNCTION_VARIANCE)
@@ -483,6 +586,7 @@ static int startsExpression(int type) {
         || type == TOKEN_LEFT_BRACKET;
 }
 
+// Words for error messages, for example "found integer literal".
 static const char *literalName(int type) {
     switch (type) {
     case TOKEN_INTEGER_LITERAL: return "integer literal";
@@ -495,6 +599,13 @@ static const char *literalName(int type) {
     }
 }
 
+// PANIC MODE RECOVERY (doc 3.5):
+//   1. skip the token that caused the error (but never a NEWLINE, }, EOF or a
+//      statement keyword, because those show where the next statement starts);
+//   2. skip tokens until a sync token: NEWLINE, }, EOF, a statement keyword,
+//      or a name on a later line;
+//   3. if it stopped at a NEWLINE, use it as the broken statement's end;
+//   4. turn panic mode off and go on with the next statement.
 static void recoverFromError(void) {
     int line = tokenLine;
     groupDepth = 0;
@@ -514,6 +625,7 @@ static void recoverFromError(void) {
     afterRecovery = tokenLine == line;
 }
 
+// <terminator> ::= \n | EOF
 static void parseTerminator(int parent, int afterParenthesis) {
     int node;
     if (tokenType != TOKEN_NEWLINE && tokenType != TOKEN_END_OF_FILE) {
@@ -532,12 +644,16 @@ static void parseTerminator(int parent, int afterParenthesis) {
     }
 }
 
+// The optional [ \n ] of the if and while rules (for example "{" on the
+// next line).
 static void skipOptionalNewline(int parent) {
     if (tokenType == TOKEN_NEWLINE) {
         matchToken(parent);
     }
 }
 
+// IDENT [ LBRACKET [ <index> ] RBRACKET ]   with   <index> ::= <expression>
+// [ COLON <expression> ]   - covers scores[0], scores[0:2] and scores[].
 static void parseIndex(int parent) {
     int index;
     matchToken(parent);
@@ -559,6 +675,7 @@ static void parseIndex(int parent) {
     matchToken(parent);
 }
 
+// <vector_lit> ::= LBRACKET [ <expression> { COMMA <expression> } ] RBRACKET
 static void parseVectorLiteral(int parent) {
     int node = addNode(parent, "<vector_lit>", -1);
     matchToken(node);
@@ -581,6 +698,8 @@ static void parseVectorLiteral(int parent) {
     matchToken(node);
 }
 
+// <func_call> ::= ( FN_MEAN | FN_MEDIAN | FN_MODE | FN_VARIANCE )
+//                 LPAREN <expression> RPAREN
 static void parseFunctionCall(int parent) {
     int node = addNode(parent, "<func_call>", -1);
     char name[NAME_MAX];
@@ -602,6 +721,10 @@ static void parseFunctionCall(int parent) {
     matchToken(node);
 }
 
+// <primary> ::= INT_LIT | DEC_LIT | CHAR_LIT | STR_LIT | KW_TRUE | KW_FALSE
+//             | IDENT [ ... index ... ] | LPAREN <expression> RPAREN
+//             | <vector_lit> | <func_call>
+// The current token alone decides which one (one token of lookahead).
 static void parsePrimary(int parent) {
     int node = addNode(parent, "<primary>", -1);
     switch (tokenType) {
@@ -650,6 +773,8 @@ static void parsePrimary(int parent) {
     }
 }
 
+// <power> ::= <primary> [ CARET <power> ]
+// Calling itself on the right makes ^ right-associative: 2 ^ 3 ^ 2 = 2 ^ 9.
 static void parsePower(int parent) {
     int node = addNode(parent, "<power>", -1);
     parsePrimary(node);
@@ -659,6 +784,7 @@ static void parsePower(int parent) {
     }
 }
 
+// <unary> ::= ( KW_NOT | MINUS ) <unary> | <power>
 static void parseUnary(int parent) {
     int node = addNode(parent, "<unary>", -1);
     if (tokenType == TOKEN_KEYWORD_NOT || tokenType == TOKEN_MINUS) {
@@ -669,6 +795,10 @@ static void parseUnary(int parent) {
     parsePower(node);
 }
 
+// <mul_expr> ::= <unary> { ( STAR | SLASH | FLOORDIV | PERCENT ) <unary> }
+// The loop makes these left-associative.
+// The functions from here up to parseOr follow the precedence table:
+// each one handles one level and calls the next higher level.
 static void parseMultiplicative(int parent) {
     int node = addNode(parent, "<mul_expr>", -1);
     parseUnary(node);
@@ -678,6 +808,7 @@ static void parseMultiplicative(int parent) {
     }
 }
 
+// <add_expr> ::= <mul_expr> { ( PLUS | MINUS ) <mul_expr> }
 static void parseAdditive(int parent) {
     int node = addNode(parent, "<add_expr>", -1);
     parseMultiplicative(node);
@@ -687,6 +818,7 @@ static void parseAdditive(int parent) {
     }
 }
 
+// <rel_expr> ::= <add_expr> { RELOP <add_expr> }   (== not= < > <= >=)
 static void parseRelational(int parent) {
     int node = addNode(parent, "<rel_expr>", -1);
     parseAdditive(node);
@@ -696,6 +828,7 @@ static void parseRelational(int parent) {
     }
 }
 
+// <and_expr> ::= <rel_expr> { KW_AND <rel_expr> }
 static void parseAnd(int parent) {
     int node = addNode(parent, "<and_expr>", -1);
     parseRelational(node);
@@ -705,6 +838,7 @@ static void parseAnd(int parent) {
     }
 }
 
+// <or_expr> ::= <and_expr> { KW_OR <and_expr> }
 static void parseOr(int parent) {
     int node = addNode(parent, "<or_expr>", -1);
     parseAnd(node);
@@ -714,11 +848,14 @@ static void parseOr(int parent) {
     }
 }
 
+// <expression> ::= <or_expr>   (the lowest precedence level)
 static void parseExpression(int parent) {
     int node = addNode(parent, "<expression>", -1);
     parseOr(node);
 }
 
+// Recovery for a bad condition (doc 3.5 "Recovery in Loops"): skip to the {
+// or the end of the line, so the block itself can still be parsed.
 static void skipToBlock(void) {
     groupDepth = 0;
     while (tokenType != TOKEN_LEFT_BRACE && tokenType != TOKEN_NEWLINE
@@ -729,6 +866,7 @@ static void skipToBlock(void) {
     afterRecovery = 1;
 }
 
+// <condition> ::= <expression>   for if, elif and while.
 static void parseCondition(int parent, const char *keyword) {
     if (!startsExpression(tokenType)) {
         syntaxError("condition expected after '%s'.", keyword);
@@ -740,6 +878,8 @@ static void parseCondition(int parent, const char *keyword) {
     }
 }
 
+// <block> ::= LBRACE { \n } { <statement> { \n } } RBRACE
+// Parses statements until the }. Reaching EOF means the } is missing.
 static void parseBlock(int parent, const char *name) {
     int node;
     if (tokenType != TOKEN_LEFT_BRACE) {
@@ -766,6 +906,11 @@ static void parseBlock(int parent, const char *name) {
     matchToken(node);
 }
 
+// <if_stmt> ::= KW_IF <condition> [ \n ] <block>
+//               { [ \n ] KW_ELIF <condition> [ \n ] <block> }
+//               [ [ \n ] KW_ELSE [ \n ] <block> ]
+// After each block it looks at the next token (past one NEWLINE):
+// elif / else = another branch, anything else = the if is finished.
 static void parseIf(int parent) {
     int node = addNode(parent, "<if_stmt>", -1);
     int sawNewline;
@@ -804,6 +949,7 @@ static void parseIf(int parent) {
     }
 }
 
+// <while_stmt> ::= KW_WHILE <condition> [ \n ] <block> [ \n ]
 static void parseWhile(int parent) {
     int node = addNode(parent, "<while_stmt>", -1);
     matchToken(node);
@@ -816,6 +962,7 @@ static void parseWhile(int parent) {
     skipOptionalNewline(node);
 }
 
+// <input_stmt> ::= KW_INPUT LPAREN IDENT RPAREN <terminator>
 static void parseInput(int parent) {
     int node = addNode(parent, "<input_stmt>", -1);
     matchToken(node);
@@ -843,6 +990,8 @@ static void parseInput(int parent) {
     parseTerminator(node, 1);
 }
 
+// If a node is just a chain of only-children ending in one token, returns that
+// token's node (for example the STR_LIT inside <expression> → ... → <primary>).
 static int singleLeaf(int node) {
     int child;
     while (node >= 0 && nodeToken[node] < 0) {
@@ -855,6 +1004,10 @@ static int singleLeaf(int node) {
     return node;
 }
 
+// Names the output form in the tree, as the doc does (3.4.2):
+// one string = <string_output>, one name = <variable_output>,
+// string , name = <mixed_output>, anything else stays <output_list>.
+// It only looks at the TOKENS, so it is still syntax.
 static void nameOutputForm(int list) {
     int first;
     int second;
@@ -894,6 +1047,8 @@ static void nameOutputForm(int list) {
     nodeLastChild[list] = variable;
 }
 
+// <output_stmt> ::= KW_PRINT LPAREN <output_content> RPAREN <terminator>
+// <output_list> ::= <expression> { COMMA <expression> }
 static void parsePrint(int parent) {
     int node = addNode(parent, "<output_stmt>", -1);
     int list;
@@ -931,6 +1086,7 @@ static void parsePrint(int parent) {
     }
 }
 
+// <assignment> ::= IDENT <assign_op> <expression> <terminator>
 static void parseAssignment(int parent) {
     int node = addNode(parent, "<assignment>", -1);
     char name[NAME_MAX];
@@ -948,6 +1104,7 @@ static void parseAssignment(int parent) {
     parseTerminator(node, 0);
 }
 
+// <declarator> ::= IDENT [ ASSIGN <expression> ]
 static void parseDeclarator(int parent) {
     int node = addNode(parent, "<declarator>", -1);
     char name[NAME_MAX];
@@ -971,6 +1128,7 @@ static void parseDeclarator(int parent) {
     }
 }
 
+// <declaration> ::= <data_type> <declarator> { COMMA <declarator> } <terminator>
 static void parseDeclaration(int parent) {
     int node = addNode(parent, "<declaration>", -1);
     matchToken(addNode(node, "<data_type>", -1));
@@ -985,6 +1143,7 @@ static void parseDeclaration(int parent) {
     parseTerminator(node, 0);
 }
 
+// The first token cannot start any statement: picks the clearest message.
 static void reportBadStatementStart(void) {
     if (tokenType == TOKEN_KEYWORD_ELIF || tokenType == TOKEN_KEYWORD_ELSE) {
         syntaxError("unexpected token '%s'.", lexeme);
@@ -997,6 +1156,11 @@ static void reportBadStatementStart(void) {
     }
 }
 
+// <statement> ::= <declaration> | <assignment> | <input_stmt>
+//               | <output_stmt> | <if_stmt> | <while_stmt>
+// The FIRST token decides which rule to use (doc 3.2): a data type,
+// an identifier, input, print, if or while. If the statement had an error,
+// panic mode recovery runs here.
 static int parseStatement(int parent) {
     int node = addNode(parent, "<statement>", -1);
     switch (tokenType) {
@@ -1034,11 +1198,14 @@ static int parseStatement(int parent) {
     return node;
 }
 
+// Prints to the screen AND to Parse Tree.txt.
 static void output(const char *text) {
     fputs(text, stdout);
     fputs(text, treeFile);
 }
 
+// Prints a node and, under it, its children. A node with only one child is
+// printed on the same line with →, like the doc's trees.
 static void printTree(int node, const char *prefix, int isLast) {
     char line[TREE_LINE_MAX];
     char childPrefix[PREFIX_MAX];
@@ -1058,6 +1225,9 @@ static void printTree(int node, const char *prefix, int isLast) {
     }
 }
 
+// PARSES THE STATEMENT IN THE BUFFER and prints its tree. After a recovery,
+// the buffer may still hold another statement, so it loops until the buffer
+// is used up. A } with no { is reported and skipped.
 static void parseCollectedStatement(void) {
     int root;
     afterRecovery = 0;
@@ -1083,6 +1253,7 @@ static void parseCollectedStatement(void) {
     }
 }
 
+// Puts the errors in line order (doc 3.5 step 6).
 static void sortErrorsByLine(void) {
     int i;
     int j;
@@ -1100,6 +1271,7 @@ static void sortErrorsByLine(void) {
     }
 }
 
+// Parse Tree.txt is written in the same folder as the Symbol Table.
 static void makeParseTreePath(const char *tablePath, char *treePath, size_t size) {
     int folderLength = 0;
     int i;
@@ -1111,6 +1283,8 @@ static void makeParseTreePath(const char *tablePath, char *treePath, size_t size
     snprintf(treePath, size, "%.*sParse Tree.txt", folderLength, tablePath);
 }
 
+// MAIN: open the files, then repeat "collect one statement, parse it, print
+// its tree" until EOF, then print the errors and the verdict.
 int main(int argc, char *argv[]) {
     char treePath[PATH_MAX_LENGTH];
     char message[MESSAGE_MAX + 64];
@@ -1136,6 +1310,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // The root of the whole parse tree. Each statement's tree is printed under it.
     output("<program>\n");
     for (;;) {
         collectStatement();
@@ -1146,6 +1321,8 @@ int main(int argc, char *argv[]) {
     }
     output(TREE_LAST "EOF\n\n");
 
+    // All statements are done: print every syntax error in line order, then the
+    // verdict. Only SYNTAX errors count (lexical errors are the lexer's job).
     sortErrorsByLine();
     for (i = 0; i < errorCount; i++) {
         snprintf(message, sizeof message, "Syntax error on line %d: %s\n", errorLine[i], errorText[i]);
