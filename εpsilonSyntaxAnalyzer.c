@@ -179,9 +179,9 @@ static const char *tokenName[TOKEN_TYPE_COUNT] = {
 #define ROW_MAX 4096
 #define LEXEME_MAX 128
 #define LABEL_MAX 200
-#define TREE_LINE_MAX 4096
-#define PREFIX_MAX 1024
-#define MAX_STATEMENT_TOKENS 10000
+#define TREE_LINE_MAX 16384
+#define PREFIX_MAX 8192
+#define MAX_STATEMENT_TOKENS 50000
 #define MAX_NODES 20000
 #define NAME_MAX 64
 #define MAX_ERRORS 500
@@ -210,6 +210,10 @@ static char statementLexeme[MAX_STATEMENT_TOKENS][LEXEME_MAX];
 static int statementLength;
 static int statementPosition;
 
+// statementTooLong = the statement had more tokens than the buffer can hold;
+// it is reported as an error instead of being parsed.
+static int statementTooLong;
+
 // The token the PARSER is looking at right now (the lookahead), taken from
 // the statement buffer. groupDepth counts open ( and [ so a NEWLINE inside
 // them is ignored (doc 3.3 "Open groups").
@@ -231,6 +235,12 @@ static int nodeNextSibling[MAX_NODES];
 static int nodeCount;
 static int treeFull;
 
+// Work space for printTree: the line being printed and the "│   " prefix.
+// They are shared (not inside printTree) so very deep trees do not use up
+// the program's stack.
+static char treeLine[TREE_LINE_MAX];
+static char treePrefix[PREFIX_MAX];
+
 // The syntax errors found so far, printed at the end in line order.
 // panicMode       = an error was found and the parser is recovering
 // afterRecovery   = do not report a second error caused by the same mistake
@@ -239,6 +249,9 @@ static int treeFull;
 static int errorLine[MAX_ERRORS];
 static char errorText[MAX_ERRORS][MESSAGE_MAX];
 static int errorCount;
+
+// Errors after the first MAX_ERRORS are still counted here, but not listed.
+static int unlistedErrorCount;
 static int panicMode;
 static int afterRecovery;
 static int offendingIsName;
@@ -246,8 +259,8 @@ static int missingBraceReported;
 
 // These two call each other (a block holds statements, a statement holds
 // expressions), so they are declared before they are defined.
-static int parseStatement(int parent);
-static void parseExpression(int parent);
+static int parse_statement(int parent);
+static void parse_expression(int parent);
 
 // Turns the token name read from the file (for example "KW_IF") back into its
 // token type. This only READS the lexer's result; tokens are never decided by
@@ -352,6 +365,7 @@ static void holdToken(void) {
 // Adds the token that was just read to the statement buffer.
 static void addToStatement(void) {
     if (statementLength >= MAX_STATEMENT_TOKENS) {
+        statementTooLong = 1;
         return;
     }
     statementType[statementLength] = readType;
@@ -382,6 +396,7 @@ static void collectStatement(void) {
     int waitingForBlock;
     statementLength = 0;
     statementPosition = 0;
+    statementTooLong = 0;
     do {
         readToken();
     } while (readType == TOKEN_NEWLINE);
@@ -531,6 +546,7 @@ static int matchToken(int parent) {
 // Stores one error message with its line number.
 static void addError(int line, const char *message) {
     if (errorCount >= MAX_ERRORS) {
+        unlistedErrorCount++;
         return;
     }
     errorLine[errorCount] = line;
@@ -626,7 +642,7 @@ static void recoverFromError(void) {
 }
 
 // <terminator> ::= \n | EOF
-static void parseTerminator(int parent, int afterParenthesis) {
+static void parse_terminator(int parent, int afterParenthesis) {
     int node;
     if (tokenType != TOKEN_NEWLINE && tokenType != TOKEN_END_OF_FILE) {
         if (afterParenthesis) {
@@ -654,15 +670,15 @@ static void skipOptionalNewline(int parent) {
 
 // IDENT [ LBRACKET [ <index> ] RBRACKET ]   with   <index> ::= <expression>
 // [ COLON <expression> ]   - covers scores[0], scores[0:2] and scores[].
-static void parseIndex(int parent) {
+static void parse_index(int parent) {
     int index;
     matchToken(parent);
     if (tokenType != TOKEN_RIGHT_BRACKET) {
         index = addNode(parent, "<index>", -1);
-        parseExpression(index);
+        parse_expression(index);
         if (!panicMode && tokenType == TOKEN_COLON) {
             matchToken(index);
-            parseExpression(index);
+            parse_expression(index);
         }
         if (panicMode) {
             return;
@@ -676,17 +692,17 @@ static void parseIndex(int parent) {
 }
 
 // <vector_lit> ::= LBRACKET [ <expression> { COMMA <expression> } ] RBRACKET
-static void parseVectorLiteral(int parent) {
+static void parse_vector_lit(int parent) {
     int node = addNode(parent, "<vector_lit>", -1);
     matchToken(node);
     if (tokenType == TOKEN_RIGHT_BRACKET) {
         matchToken(node);
         return;
     }
-    parseExpression(node);
+    parse_expression(node);
     while (!panicMode && tokenType == TOKEN_COMMA) {
         matchToken(node);
-        parseExpression(node);
+        parse_expression(node);
     }
     if (panicMode) {
         return;
@@ -700,7 +716,7 @@ static void parseVectorLiteral(int parent) {
 
 // <func_call> ::= ( FN_MEAN | FN_MEDIAN | FN_MODE | FN_VARIANCE )
 //                 LPAREN <expression> RPAREN
-static void parseFunctionCall(int parent) {
+static void parse_func_call(int parent) {
     int node = addNode(parent, "<func_call>", -1);
     char name[NAME_MAX];
     snprintf(name, NAME_MAX, "%.63s", lexeme);
@@ -710,7 +726,7 @@ static void parseFunctionCall(int parent) {
         return;
     }
     matchToken(node);
-    parseExpression(node);
+    parse_expression(node);
     if (panicMode) {
         return;
     }
@@ -725,7 +741,7 @@ static void parseFunctionCall(int parent) {
 //             | IDENT [ ... index ... ] | LPAREN <expression> RPAREN
 //             | <vector_lit> | <func_call>
 // The current token alone decides which one (one token of lookahead).
-static void parsePrimary(int parent) {
+static void parse_primary(int parent) {
     int node = addNode(parent, "<primary>", -1);
     switch (tokenType) {
     case TOKEN_INTEGER_LITERAL:
@@ -739,12 +755,12 @@ static void parsePrimary(int parent) {
     case TOKEN_IDENTIFIER:
         matchToken(node);
         if (tokenType == TOKEN_LEFT_BRACKET) {
-            parseIndex(node);
+            parse_index(node);
         }
         return;
     case TOKEN_LEFT_PARENTHESIS:
         matchToken(node);
-        parseExpression(node);
+        parse_expression(node);
         if (panicMode) {
             return;
         }
@@ -755,13 +771,13 @@ static void parsePrimary(int parent) {
         matchToken(node);
         return;
     case TOKEN_LEFT_BRACKET:
-        parseVectorLiteral(node);
+        parse_vector_lit(node);
         return;
     case TOKEN_FUNCTION_MEAN:
     case TOKEN_FUNCTION_MEDIAN:
     case TOKEN_FUNCTION_MODE:
     case TOKEN_FUNCTION_VARIANCE:
-        parseFunctionCall(node);
+        parse_func_call(node);
         return;
     default:
         if (isReservedWord(tokenType)) {
@@ -775,83 +791,83 @@ static void parsePrimary(int parent) {
 
 // <power> ::= <primary> [ CARET <power> ]
 // Calling itself on the right makes ^ right-associative: 2 ^ 3 ^ 2 = 2 ^ 9.
-static void parsePower(int parent) {
+static void parse_power(int parent) {
     int node = addNode(parent, "<power>", -1);
-    parsePrimary(node);
+    parse_primary(node);
     if (!panicMode && tokenType == TOKEN_EXPONENT) {
         matchToken(node);
-        parsePower(node);
+        parse_power(node);
     }
 }
 
 // <unary> ::= ( KW_NOT | MINUS ) <unary> | <power>
-static void parseUnary(int parent) {
+static void parse_unary(int parent) {
     int node = addNode(parent, "<unary>", -1);
     if (tokenType == TOKEN_KEYWORD_NOT || tokenType == TOKEN_MINUS) {
         matchToken(node);
-        parseUnary(node);
+        parse_unary(node);
         return;
     }
-    parsePower(node);
+    parse_power(node);
 }
 
 // <mul_expr> ::= <unary> { ( STAR | SLASH | FLOORDIV | PERCENT ) <unary> }
 // The loop makes these left-associative.
-// The functions from here up to parseOr follow the precedence table:
+// The functions from here up to parse_or_expr follow the precedence table:
 // each one handles one level and calls the next higher level.
-static void parseMultiplicative(int parent) {
+static void parse_mul_expr(int parent) {
     int node = addNode(parent, "<mul_expr>", -1);
-    parseUnary(node);
+    parse_unary(node);
     while (!panicMode && tokenType >= TOKEN_MULTIPLY && tokenType <= TOKEN_MODULO) {
         matchToken(node);
-        parseUnary(node);
+        parse_unary(node);
     }
 }
 
 // <add_expr> ::= <mul_expr> { ( PLUS | MINUS ) <mul_expr> }
-static void parseAdditive(int parent) {
+static void parse_add_expr(int parent) {
     int node = addNode(parent, "<add_expr>", -1);
-    parseMultiplicative(node);
+    parse_mul_expr(node);
     while (!panicMode && (tokenType == TOKEN_PLUS || tokenType == TOKEN_MINUS)) {
         matchToken(node);
-        parseMultiplicative(node);
+        parse_mul_expr(node);
     }
 }
 
 // <rel_expr> ::= <add_expr> { RELOP <add_expr> }   (== not= < > <= >=)
-static void parseRelational(int parent) {
+static void parse_rel_expr(int parent) {
     int node = addNode(parent, "<rel_expr>", -1);
-    parseAdditive(node);
+    parse_add_expr(node);
     while (!panicMode && tokenType >= TOKEN_EQUAL && tokenType <= TOKEN_GREATER_THAN_OR_EQUAL) {
         matchToken(node);
-        parseAdditive(node);
+        parse_add_expr(node);
     }
 }
 
 // <and_expr> ::= <rel_expr> { KW_AND <rel_expr> }
-static void parseAnd(int parent) {
+static void parse_and_expr(int parent) {
     int node = addNode(parent, "<and_expr>", -1);
-    parseRelational(node);
+    parse_rel_expr(node);
     while (!panicMode && tokenType == TOKEN_KEYWORD_AND) {
         matchToken(node);
-        parseRelational(node);
+        parse_rel_expr(node);
     }
 }
 
 // <or_expr> ::= <and_expr> { KW_OR <and_expr> }
-static void parseOr(int parent) {
+static void parse_or_expr(int parent) {
     int node = addNode(parent, "<or_expr>", -1);
-    parseAnd(node);
+    parse_and_expr(node);
     while (!panicMode && tokenType == TOKEN_KEYWORD_OR) {
         matchToken(node);
-        parseAnd(node);
+        parse_and_expr(node);
     }
 }
 
 // <expression> ::= <or_expr>   (the lowest precedence level)
-static void parseExpression(int parent) {
+static void parse_expression(int parent) {
     int node = addNode(parent, "<expression>", -1);
-    parseOr(node);
+    parse_or_expr(node);
 }
 
 // Recovery for a bad condition (doc 3.5 "Recovery in Loops"): skip to the {
@@ -867,11 +883,11 @@ static void skipToBlock(void) {
 }
 
 // <condition> ::= <expression>   for if, elif and while.
-static void parseCondition(int parent, const char *keyword) {
+static void parse_condition(int parent, const char *keyword) {
     if (!startsExpression(tokenType)) {
         syntaxError("condition expected after '%s'.", keyword);
     } else {
-        parseExpression(addNode(parent, "<condition>", -1));
+        parse_expression(addNode(parent, "<condition>", -1));
     }
     if (panicMode) {
         skipToBlock();
@@ -880,7 +896,7 @@ static void parseCondition(int parent, const char *keyword) {
 
 // <block> ::= LBRACE { \n } { <statement> { \n } } RBRACE
 // Parses statements until the }. Reaching EOF means the } is missing.
-static void parseBlock(int parent, const char *name) {
+static void parse_block(int parent, const char *name) {
     int node;
     if (tokenType != TOKEN_LEFT_BRACE) {
         syntaxError("'{' expected to start the %s.", name);
@@ -892,7 +908,7 @@ static void parseBlock(int parent, const char *name) {
         if (tokenType == TOKEN_NEWLINE) {
             getToken();
         } else {
-            parseStatement(node);
+            parse_statement(node);
         }
     }
     if (tokenType == TOKEN_END_OF_FILE) {
@@ -911,14 +927,14 @@ static void parseBlock(int parent, const char *name) {
 //               [ [ \n ] KW_ELSE [ \n ] <block> ]
 // After each block it looks at the next token (past one NEWLINE):
 // elif / else = another branch, anything else = the if is finished.
-static void parseIf(int parent) {
+static void parse_if(int parent) {
     int node = addNode(parent, "<if_stmt>", -1);
     int sawNewline;
     int sawElse = 0;
     matchToken(node);
-    parseCondition(node, "if");
+    parse_condition(node, "if");
     skipOptionalNewline(node);
-    parseBlock(node, "if body");
+    parse_block(node, "if body");
     while (!panicMode) {
         sawNewline = 0;
         if (tokenType == TOKEN_NEWLINE) {
@@ -939,23 +955,23 @@ static void parseIf(int parent) {
             sawElse = 1;
             matchToken(node);
             skipOptionalNewline(node);
-            parseBlock(node, "else body");
+            parse_block(node, "else body");
         } else {
             matchToken(node);
-            parseCondition(node, "elif");
+            parse_condition(node, "elif");
             skipOptionalNewline(node);
-            parseBlock(node, "elif body");
+            parse_block(node, "elif body");
         }
     }
 }
 
 // <while_stmt> ::= KW_WHILE <condition> [ \n ] <block> [ \n ]
-static void parseWhile(int parent) {
+static void parse_while(int parent) {
     int node = addNode(parent, "<while_stmt>", -1);
     matchToken(node);
-    parseCondition(node, "while");
+    parse_condition(node, "while");
     skipOptionalNewline(node);
-    parseBlock(node, "loop body");
+    parse_block(node, "loop body");
     if (panicMode) {
         return;
     }
@@ -963,7 +979,7 @@ static void parseWhile(int parent) {
 }
 
 // <input_stmt> ::= KW_INPUT LPAREN IDENT RPAREN <terminator>
-static void parseInput(int parent) {
+static void parse_input(int parent) {
     int node = addNode(parent, "<input_stmt>", -1);
     matchToken(node);
     if (tokenType != TOKEN_LEFT_PARENTHESIS) {
@@ -987,71 +1003,80 @@ static void parseInput(int parent) {
         return;
     }
     matchToken(node);
-    parseTerminator(node, 1);
+    parse_terminator(node, 1);
 }
 
-// If a node is just a chain of only-children ending in one token, returns that
-// token's node (for example the STR_LIT inside <expression> → ... → <primary>).
-static int singleLeaf(int node) {
-    int child;
-    while (node >= 0 && nodeToken[node] < 0) {
-        child = nodeFirstChild[node];
-        if (child < 0 || nodeNextSibling[child] >= 0) {
-            return -1;
+// Looks AHEAD in the statement buffer without moving: peekType(1) is the
+// token after the current one, peekType(2) the one after that. NEWLINEs are
+// skipped (inside print( ) they do not count). Used only by
+// parse_output_content() to choose the output form.
+static int peekType(int distance) {
+    int position = statementPosition;
+    if (distance == 0) {
+        return tokenType;
+    }
+    while (position < statementLength) {
+        if (statementType[position] != TOKEN_NEWLINE) {
+            distance--;
+            if (distance == 0) {
+                return statementType[position];
+            }
         }
-        node = child;
+        position++;
     }
-    return node;
+    return TOKEN_END_OF_FILE;
 }
 
-// Names the output form in the tree, as the doc does (3.4.2):
-// one string = <string_output>, one name = <variable_output>,
-// string , name = <mixed_output>, anything else stays <output_list>.
-// It only looks at the TOKENS, so it is still syntax.
-static void nameOutputForm(int list) {
-    int first;
-    int second;
-    int third;
-    int text;
-    int variable;
-    if (list < 0) {
-        return;
+// <string_output> ::= STR_LIT
+static void parse_string_output(int parent) {
+    matchToken(addNode(parent, "<string_output>", -1));
+}
+
+// <variable_output> ::= IDENT
+static void parse_variable_output(int parent) {
+    matchToken(addNode(parent, "<variable_output>", -1));
+}
+
+// <mixed_output> ::= STR_LIT COMMA IDENT   (three tokens, already checked by
+// parse_output_content, so they are matched one after another)
+static void parse_mixed_output(int parent) {
+    int node = addNode(parent, "<mixed_output>", -1);
+    matchToken(node);
+    matchToken(node);
+    matchToken(node);
+}
+
+// <output_list> ::= <expression> { COMMA <expression> }
+static void parse_output_list(int parent) {
+    int node = addNode(parent, "<output_list>", -1);
+    parse_expression(node);
+    while (!panicMode && tokenType == TOKEN_COMMA) {
+        matchToken(node);
+        parse_expression(node);
     }
-    first = nodeFirstChild[list];
-    second = first >= 0 ? nodeNextSibling[first] : -1;
-    third = second >= 0 ? nodeNextSibling[second] : -1;
-    text = singleLeaf(first);
-    if (second < 0 && text >= 0 && nodeToken[text] == TOKEN_STRING_LITERAL) {
-        snprintf(nodeLabel[list], LABEL_MAX, "<string_output>");
-        nodeFirstChild[list] = text;
-        nodeLastChild[list] = text;
-        return;
+}
+
+// <output_content> ::= <string_output> | <variable_output> | <mixed_output>
+//                    | <output_list>
+// Chooses the form by looking at the items between the parentheses (doc 3.4.2):
+// one string, one name, string , name - anything else is a general list.
+static void parse_output_content(int parent) {
+    int node = addNode(parent, "<output_content>", -1);
+    if (tokenType == TOKEN_STRING_LITERAL && peekType(1) == TOKEN_RIGHT_PARENTHESIS) {
+        parse_string_output(node);
+    } else if (tokenType == TOKEN_IDENTIFIER && peekType(1) == TOKEN_RIGHT_PARENTHESIS) {
+        parse_variable_output(node);
+    } else if (tokenType == TOKEN_STRING_LITERAL && peekType(1) == TOKEN_COMMA
+               && peekType(2) == TOKEN_IDENTIFIER && peekType(3) == TOKEN_RIGHT_PARENTHESIS) {
+        parse_mixed_output(node);
+    } else {
+        parse_output_list(node);
     }
-    if (second < 0 && text >= 0 && nodeToken[text] == TOKEN_IDENTIFIER) {
-        snprintf(nodeLabel[list], LABEL_MAX, "<variable_output>");
-        nodeFirstChild[list] = text;
-        nodeLastChild[list] = text;
-        return;
-    }
-    if (third < 0 || nodeNextSibling[third] >= 0 || text < 0 || nodeToken[text] != TOKEN_STRING_LITERAL) {
-        return;
-    }
-    variable = singleLeaf(third);
-    if (variable < 0 || nodeToken[variable] != TOKEN_IDENTIFIER) {
-        return;
-    }
-    snprintf(nodeLabel[list], LABEL_MAX, "<mixed_output>");
-    nodeFirstChild[list] = text;
-    nodeNextSibling[text] = second;
-    nodeNextSibling[second] = variable;
-    nodeLastChild[list] = variable;
 }
 
 // <output_stmt> ::= KW_PRINT LPAREN <output_content> RPAREN <terminator>
-// <output_list> ::= <expression> { COMMA <expression> }
-static void parsePrint(int parent) {
+static void parse_output_stmt(int parent) {
     int node = addNode(parent, "<output_stmt>", -1);
-    int list;
     matchToken(node);
     if (tokenType != TOKEN_LEFT_PARENTHESIS) {
         syntaxError("'(' expected after 'print'.");
@@ -1062,12 +1087,7 @@ static void parsePrint(int parent) {
         syntaxError("output content expected inside 'print( )'.");
         return;
     }
-    list = addNode(addNode(node, "<output_content>", -1), "<output_list>", -1);
-    parseExpression(list);
-    while (!panicMode && tokenType == TOKEN_COMMA) {
-        matchToken(list);
-        parseExpression(list);
-    }
+    parse_output_content(node);
     if (panicMode) {
         return;
     }
@@ -1080,32 +1100,43 @@ static void parsePrint(int parent) {
         return;
     }
     matchToken(node);
-    parseTerminator(node, 1);
-    if (!panicMode) {
-        nameOutputForm(list);
+    parse_terminator(node, 1);
+}
+
+// <assign_op> ::= ASSIGN | PLUS_EQ | MINUS_EQ | STAR_EQ | SLASH_EQ
+//               | PERCENT_EQ | CARET_EQ
+static void parse_assign_op(int parent) {
+    if (!isAssignOperator(tokenType)) {
+        syntaxError("assignment operator expected after '%s'.", previousLexeme);
+        return;
     }
+    matchToken(addNode(parent, "<assign_op>", -1));
 }
 
 // <assignment> ::= IDENT <assign_op> <expression> <terminator>
-static void parseAssignment(int parent) {
+static void parse_assignment(int parent) {
     int node = addNode(parent, "<assignment>", -1);
-    char name[NAME_MAX];
-    snprintf(name, NAME_MAX, "%.63s", lexeme);
     matchToken(node);
-    if (!isAssignOperator(tokenType)) {
-        syntaxError("assignment operator expected after '%s'.", name);
-        return;
-    }
-    matchToken(addNode(node, "<assign_op>", -1));
-    parseExpression(node);
+    parse_assign_op(node);
     if (panicMode) {
         return;
     }
-    parseTerminator(node, 0);
+    parse_expression(node);
+    if (panicMode) {
+        return;
+    }
+    parse_terminator(node, 0);
+}
+
+// <data_type> ::= KW_INTEGER | KW_DECIMAL | KW_CHARACTER | KW_STRING
+//               | KW_BOOLEAN | KW_VECTOR
+// (parse_statement already checked that the token is one of these)
+static void parse_data_type(int parent) {
+    matchToken(addNode(parent, "<data_type>", -1));
 }
 
 // <declarator> ::= IDENT [ ASSIGN <expression> ]
-static void parseDeclarator(int parent) {
+static void parse_declarator(int parent) {
     int node = addNode(parent, "<declarator>", -1);
     char name[NAME_MAX];
     if (tokenType != TOKEN_IDENTIFIER) {
@@ -1120,7 +1151,7 @@ static void parseDeclarator(int parent) {
     matchToken(node);
     if (tokenType == TOKEN_ASSIGN) {
         matchToken(node);
-        parseExpression(node);
+        parse_expression(node);
     } else if (isAssignOperator(tokenType)) {
         syntaxError("'%s' cannot be used in a declaration, use '='.", lexeme);
     } else if (tokenType != TOKEN_COMMA && tokenType != TOKEN_NEWLINE && tokenType != TOKEN_END_OF_FILE) {
@@ -1129,18 +1160,18 @@ static void parseDeclarator(int parent) {
 }
 
 // <declaration> ::= <data_type> <declarator> { COMMA <declarator> } <terminator>
-static void parseDeclaration(int parent) {
+static void parse_declaration(int parent) {
     int node = addNode(parent, "<declaration>", -1);
-    matchToken(addNode(node, "<data_type>", -1));
-    parseDeclarator(node);
+    parse_data_type(node);
+    parse_declarator(node);
     while (!panicMode && tokenType == TOKEN_COMMA) {
         matchToken(node);
-        parseDeclarator(node);
+        parse_declarator(node);
     }
     if (panicMode) {
         return;
     }
-    parseTerminator(node, 0);
+    parse_terminator(node, 0);
 }
 
 // The first token cannot start any statement: picks the clearest message.
@@ -1161,7 +1192,7 @@ static void reportBadStatementStart(void) {
 // The FIRST token decides which rule to use (doc 3.2): a data type,
 // an identifier, input, print, if or while. If the statement had an error,
 // panic mode recovery runs here.
-static int parseStatement(int parent) {
+static int parse_statement(int parent) {
     int node = addNode(parent, "<statement>", -1);
     switch (tokenType) {
     case TOKEN_KEYWORD_INTEGER:
@@ -1170,22 +1201,22 @@ static int parseStatement(int parent) {
     case TOKEN_KEYWORD_STRING:
     case TOKEN_KEYWORD_BOOLEAN:
     case TOKEN_KEYWORD_VECTOR:
-        parseDeclaration(node);
+        parse_declaration(node);
         break;
     case TOKEN_IDENTIFIER:
-        parseAssignment(node);
+        parse_assignment(node);
         break;
     case TOKEN_KEYWORD_INPUT:
-        parseInput(node);
+        parse_input(node);
         break;
     case TOKEN_KEYWORD_PRINT:
-        parsePrint(node);
+        parse_output_stmt(node);
         break;
     case TOKEN_KEYWORD_IF:
-        parseIf(node);
+        parse_if(node);
         break;
     case TOKEN_KEYWORD_WHILE:
-        parseWhile(node);
+        parse_while(node);
         break;
     default:
         reportBadStatementStart();
@@ -1206,22 +1237,25 @@ static void output(const char *text) {
 
 // Prints a node and, under it, its children. A node with only one child is
 // printed on the same line with →, like the doc's trees.
-static void printTree(int node, const char *prefix, int isLast) {
-    char line[TREE_LINE_MAX];
-    char childPrefix[PREFIX_MAX];
+static void printTree(int node, size_t prefixLength, int isLast) {
     size_t used;
+    size_t childLength = prefixLength;
     int child;
-    snprintf(line, TREE_LINE_MAX, "%s%s%s", prefix, isLast ? TREE_LAST : TREE_BRANCH, nodeLabel[node]);
+    treePrefix[prefixLength] = '\0';
+    snprintf(treeLine, TREE_LINE_MAX, "%s%s%s", treePrefix, isLast ? TREE_LAST : TREE_BRANCH, nodeLabel[node]);
     while (nodeToken[node] < 0 && nodeFirstChild[node] >= 0 && nodeNextSibling[nodeFirstChild[node]] < 0) {
         node = nodeFirstChild[node];
-        used = strlen(line);
-        snprintf(line + used, TREE_LINE_MAX - used, "%s%s", TREE_ARROW, nodeLabel[node]);
+        used = strlen(treeLine);
+        snprintf(treeLine + used, TREE_LINE_MAX - used, "%s%s", TREE_ARROW, nodeLabel[node]);
     }
-    output(line);
+    output(treeLine);
     output("\n");
-    snprintf(childPrefix, PREFIX_MAX, "%.1000s%s", prefix, isLast ? TREE_SPACE : TREE_PIPE);
+    if (prefixLength + 8 < PREFIX_MAX) {
+        strcpy(treePrefix + prefixLength, isLast ? TREE_SPACE : TREE_PIPE);
+        childLength = strlen(treePrefix);
+    }
     for (child = nodeFirstChild[node]; child >= 0; child = nodeNextSibling[child]) {
-        printTree(child, childPrefix, nodeNextSibling[child] < 0);
+        printTree(child, childLength, nodeNextSibling[child] < 0);
     }
 }
 
@@ -1229,7 +1263,13 @@ static void printTree(int node, const char *prefix, int isLast) {
 // the buffer may still hold another statement, so it loops until the buffer
 // is used up. A } with no { is reported and skipped.
 static void parseCollectedStatement(void) {
+    char message[MESSAGE_MAX];
     int root;
+    if (statementTooLong) {
+        snprintf(message, MESSAGE_MAX, "statement is too long (more than %d tokens), it was not parsed.", MAX_STATEMENT_TOKENS);
+        addError(statementLine[0], message);
+        return;
+    }
     afterRecovery = 0;
     getToken();
     while (tokenType != TOKEN_END_OF_FILE) {
@@ -1245,8 +1285,8 @@ static void parseCollectedStatement(void) {
         }
         nodeCount = 0;
         treeFull = 0;
-        root = parseStatement(-1);
-        printTree(root, "", 0);
+        root = parse_statement(-1);
+        printTree(root, 0, 0);
         if (treeFull) {
             output(TREE_PIPE "(this statement is too large, some nodes are not shown)\n");
         }
@@ -1328,8 +1368,12 @@ int main(int argc, char *argv[]) {
         snprintf(message, sizeof message, "Syntax error on line %d: %s\n", errorLine[i], errorText[i]);
         output(message);
     }
+    if (unlistedErrorCount > 0) {
+        snprintf(message, sizeof message, "(only the first %d errors are listed)\n", MAX_ERRORS);
+        output(message);
+    }
     if (errorCount > 0) {
-        snprintf(message, sizeof message, "%d syntax error(s) found. The program is rejected.\n", errorCount);
+        snprintf(message, sizeof message, "%d syntax error(s) found. The program is rejected.\n", errorCount + unlistedErrorCount);
     } else {
         snprintf(message, sizeof message, "No syntax error found. The program is accepted.\n");
     }

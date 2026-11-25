@@ -96,36 +96,51 @@ rule expects, and **calls** the function of any other rule inside it.
   can never run past its own statement.
 - `matchToken()` accepts the current token: it becomes a **leaf** of the tree
   (for example `KW_IF 'if'`) and the parser moves on.
-- The **first token** of a statement decides the rule (`parseStatement()`):
+- The **first token** of a statement decides the rule (`parse_statement()`):
 
 | First token | Rule | Function |
 |---|---|---|
-| `integer decimal character string boolean vector` | `<declaration>` | `parseDeclaration()` |
-| an identifier | `<assignment>` | `parseAssignment()` |
-| `input` | `<input_stmt>` | `parseInput()` |
-| `print` | `<output_stmt>` | `parsePrint()` |
-| `if` | `<if_stmt>` | `parseIf()` |
-| `while` | `<while_stmt>` | `parseWhile()` |
+| `integer decimal character string boolean vector` | `<declaration>` | `parse_declaration()` |
+| an identifier | `<assignment>` | `parse_assignment()` |
+| `input` | `<input_stmt>` | `parse_input()` |
+| `print` | `<output_stmt>` | `parse_output_stmt()` |
+| `if` | `<if_stmt>` | `parse_if()` |
+| `while` | `<while_stmt>` | `parse_while()` |
 
 **Expressions** follow the precedence table, lowest to highest. Each function
 handles one level and calls the next one:
 
 | Function | Operators | Level |
 |---|---|---|
-| `parseExpression()` → `parseOr()` | `or` | lowest |
-| `parseAnd()` | `and` | |
-| `parseRelational()` | `== not= < > <= >=` | |
-| `parseAdditive()` | `+ -` | |
-| `parseMultiplicative()` | `* / // %` | |
-| `parseUnary()` | `not`, `-` (negative) | |
-| `parsePower()` | `^` | |
-| `parsePrimary()` | numbers, names, `( )`, `[ ]`, `mean(...)` | highest |
+| `parse_expression()` → `parse_or_expr()` | `or` | lowest |
+| `parse_and_expr()` | `and` | |
+| `parse_rel_expr()` | `== not= < > <= >=` | |
+| `parse_add_expr()` | `+ -` | |
+| `parse_mul_expr()` | `* / // %` | |
+| `parse_unary()` | `not`, `-` (negative) | |
+| `parse_power()` | `^` | |
+| `parse_primary()` | numbers, names, `( )`, `[ ]`, `mean(...)` | highest |
 
 That is why `x + y * z` multiplies first: `*` is handled deeper (higher) than `+`.
-`parsePower()` calls **itself** on the right, which makes `^` right-associative.
+`parse_power()` calls **itself** on the right, which makes `^` right-associative.
 
-**Blocks** (`parseBlock()`) parse statements until `}`. Because a block calls
-`parseStatement()`, an `if` inside a `while` (or a loop in a loop) just works.
+**Blocks** (`parse_block()`) parse statements until `}`. Because a block calls
+`parse_statement()`, an `if` inside a `while` (or a loop in a loop) just works.
+
+**The function names are the doc's names.** Every function the Syntax doc
+mentions in its traces (`parse_input()`, `parse_output_content()`,
+`parse_assign_op()`, `parse_data_type()`, ...) exists in the code with exactly
+that name, so you can follow any trace in the doc line by line in the code.
+
+**Print forms.** `parse_output_content()` decides between the four forms of
+3.4.2 by looking ahead inside the statement buffer with `peekType()`:
+
+| Between the parentheses | Function |
+|---|---|
+| one string: `print("Hi")` | `parse_string_output()` |
+| one name: `print(count)` | `parse_variable_output()` |
+| string, name: `print("Score: ", score)` | `parse_mixed_output()` |
+| anything else: `print(total / count, name)` | `parse_output_list()` |
 
 ---
 
@@ -137,6 +152,18 @@ Each statement's tree is built in fixed arrays (`nodeLabel`, `nodeFirstChild`,
 - `├──` a child with more after it, `└──` the last child, `│` the line going down
 - `<...>` a non-terminal (a grammar rule), `TOKEN 'lexeme'` a leaf (a token)
 - `A → B` means **B is the only child of A** (the doc's convention in 3.4.5)
+
+**Fixed limits** (everything is a fixed-size array, nothing grows):
+
+| Limit | What happens when it is passed |
+|---|---|
+| 50000 tokens in one statement | `statement is too long (more than 50000 tokens), it was not parsed.` |
+| 20000 tree nodes in one statement | the tree is printed with `(this statement is too large, some nodes are not shown)`; the check still runs |
+| 500 listed errors | all errors are counted, the list ends with `(only the first 500 errors are listed)` |
+
+`printTree()` keeps its work space (`treeLine`, `treePrefix`) outside the
+function, so even a very deeply nested program (hundreds of nested `if`s or
+parentheses) cannot crash it.
 
 ---
 
@@ -173,10 +200,10 @@ while x < 3 {
 ```
 
 **Line 1.** Rows read: `KW_INTEGER IDENT ASSIGN INT_LIT NEWLINE`. The NEWLINE ends
-the statement. `KW_INTEGER` → `parseDeclaration()` → match the type, call
-`parseDeclarator()` (match `x`, `=`, parse the expression `5`), match the terminator.
+the statement. `KW_INTEGER` → `parse_declaration()` → match the type, call
+`parse_declarator()` (match `x`, `=`, parse the expression `5`), match the terminator.
 
-**Line 2.** Buffer: `KW_INPUT IDENT RPAREN NEWLINE`. `parseInput()` matches
+**Line 2.** Buffer: `KW_INPUT IDENT RPAREN NEWLINE`. `parse_input()` matches
 `input`, then expects `(` but finds `count` → **error**. Recovery skips `count`
 and `)`, uses the NEWLINE as the end, and moves on.
 
@@ -270,13 +297,18 @@ parsed.
 | `holdToken()` | Keep a token read too early for the next statement | 3.3 Blocks |
 | `getToken()` | Parser's next token, from the buffer | 3.2 (lookahead) |
 | `matchToken()` | Accept a token, add it as a leaf | 3.2 |
-| `parseStatement()` | Choose the rule from the first token | 3.2, 3.4 `<statement>` |
-| `parseDeclaration()`, `parseDeclarator()` | `integer x = 1, y` | 3.4.6 |
-| `parseAssignment()` | `x += 1` | 3.4.3 |
-| `parseInput()` | `input(x)` | 3.4.1 |
-| `parsePrint()`, `nameOutputForm()` | `print(...)` and its form | 3.4.2 |
-| `parseIf()`, `parseWhile()`, `parseBlock()`, `parseCondition()` | if / elif / else, while, `{ }` | 3.4.4, 3.4.5 |
-| `parseExpression()` ... `parsePrimary()` | Expressions by precedence | 3.4 shared rules |
+| `parse_statement()` | Choose the rule from the first token | 3.2, 3.4 `<statement>` |
+| `parse_declaration()`, `parse_data_type()`, `parse_declarator()` | `integer x = 1, y` | 3.4.6 |
+| `parse_vector_lit()` | `[1, 2, 3]` | 3.4.6 |
+| `parse_assignment()`, `parse_assign_op()` | `x += 1` | 3.4.3 |
+| `parse_input()` | `input(x)` | 3.4.1 |
+| `parse_output_stmt()`, `parse_output_content()` | `print(...)` | 3.4.2 |
+| `parse_string_output()`, `parse_variable_output()`, `parse_mixed_output()`, `parse_output_list()` | the four print forms | 3.4.2 |
+| `peekType()` | Look ahead in the buffer (for the print form) | 3.4.2 |
+| `parse_if()`, `parse_while()`, `parse_block()`, `parse_condition()` | if / elif / else, while, `{ }` | 3.4.4, 3.4.5 |
+| `parse_terminator()` | `\n` or EOF at the end of a statement | 3.4 `<terminator>` |
+| `parse_expression()` ... `parse_primary()` | Expressions by precedence | 3.4 shared rules |
+| `parse_index()`, `parse_func_call()` | `scores[0:2]`, `mean(scores)` | 3.4 `<index>`, `<func_call>` |
 | `syntaxError()`, `recoverFromError()`, `skipToBlock()` | Report and recover | 3.5 |
 | `printTree()` | Draw the tree | 3.4 parse trees |
 | `main()` | Run everything, print errors and the verdict | 3.3, 3.5 |
