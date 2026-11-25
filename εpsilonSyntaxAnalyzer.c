@@ -1128,11 +1128,12 @@ static void parseAssignment(int parent) {
         return;
     }
     if (operatorToken != TOKEN_ASSIGN) {
+        int result = operatorToken == TOKEN_DIVIDE_ASSIGN ? TYPE_DECIMAL : value;
         if (target != TYPE_UNKNOWN && target != TYPE_INTEGER && target != TYPE_DECIMAL && target != TYPE_VECTOR) {
             semanticError(line, "'%s' needs an integer, decimal, or vector variable, found %s '%s'.",
                           operatorText, typeName[target], name);
-        } else if (checkNumeric(value, operatorText, line) && target != TYPE_VECTOR && !canAssign(target, value)) {
-            semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[value], typeName[target], name);
+        } else if (checkNumeric(value, operatorText, line) && target != TYPE_VECTOR && !canAssign(target, result)) {
+            semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[result], typeName[target], name);
         }
     } else if (!canAssign(target, value)) {
         semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[value], typeName[target], name);
