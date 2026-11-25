@@ -1,0 +1,86 @@
+# Section 1: Declarations
+integer count = 10
+decimal ratio = 2.5
+string name = "Juan"
+boolean ready = true
+vector scores = [1, 2, 3]
+character grade = 'A'
+integer total = 0
+
+# Section 2: Lexical errors
+integer a = 5;
+integer b = 4 @
+integer c = 4 $
+boolean f = true &
+boolean g = true !
+decimal d = 2.5 5.
+integer e = 7 3stats
+character h = 'z' ''
+character i = 'z' 'ab'
+character j = 'z' 'x
+string k = "ok" "oops
+print("fine")
+
+# Section 3: Syntax errors
+input()
+input count)
+input(count 5)
+input(while)
+input(5)
+input(scores)
+print "hi"
+print("Score: " count)
+print("a" {
+print()
+integer = 1
+integer if
+integer mean
+integer p q
+integer r += 1
+integer s = 1,
+5 = count
+total 3
+count = (1 + 2 5
+count = 1 + )
+vector v1 = [1, 2,]
+vector v2 = [1, 2 5
+count = scores[0 5
+if {
+    print(count)
+}
+if ready print(count)
+else print(count)
+if ready {
+    print(count)
+} else {
+    print(count)
+} elif ready {
+    print(count)
+}
+print(count)
+elif ready print(count)
+}
+
+# Section 4: Type errors
+count = ratio
+name += 1
+count /= 2
+vector bad = [1, "x"]
+count = total[0]
+decimal mm = mean(total)
+boolean cmp = name < 3
+boolean lg = count and ready
+boolean nt = not count
+count = missing + 1
+if count + 1 {
+    print(count)
+}
+while count + 1 {
+    print(count)
+}
+
+# Section 5: Unclosed comment
+while count < 10 {
+    print(count)
+/* this comment is never closed
+}

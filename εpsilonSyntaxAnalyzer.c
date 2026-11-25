@@ -197,6 +197,7 @@ static int variableCount;
 static int errorLine[MAX_ERRORS];
 static char errorText[MAX_ERRORS][MESSAGE_MAX];
 static int errorCount;
+static int lexicalErrorCount;
 static int pendingLine[MAX_ERRORS];
 static char pendingText[MAX_ERRORS][MESSAGE_MAX];
 static int pendingCount;
@@ -259,6 +260,9 @@ static void readRow(void) {
         type = tokenFromName(name);
         if (type < 0) {
             continue;
+        }
+        if (type == TOKEN_ERROR) {
+            lexicalErrorCount++;
         }
         tokenType = type;
         tokenLine = line;
@@ -1354,8 +1358,12 @@ int main(int argc, char *argv[]) {
         snprintf(message, sizeof message, "Syntax error on line %d: %s\n", errorLine[i], errorText[i]);
         output(message);
     }
-    if (errorCount > 0) {
+    if (errorCount > 0 && lexicalErrorCount > 0) {
+        snprintf(message, sizeof message, "%d syntax error(s) found, and the lexer reported %d lexical error(s). The program is rejected.\n", errorCount, lexicalErrorCount);
+    } else if (errorCount > 0) {
         snprintf(message, sizeof message, "%d syntax error(s) found. The program is rejected.\n", errorCount);
+    } else if (lexicalErrorCount > 0) {
+        snprintf(message, sizeof message, "No syntax error found, but the lexer reported %d lexical error(s). The program is rejected.\n", lexicalErrorCount);
     } else {
         snprintf(message, sizeof message, "No syntax error found. The program is accepted.\n");
     }
@@ -1364,5 +1372,5 @@ int main(int argc, char *argv[]) {
 
     fclose(symbolTable);
     fclose(treeFile);
-    return errorCount > 0;
+    return errorCount > 0 || lexicalErrorCount > 0;
 }
