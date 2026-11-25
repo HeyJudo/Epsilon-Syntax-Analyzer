@@ -276,10 +276,12 @@ static int isDiscarded(int type) {
 }
 
 static void getToken(void) {
+    int previousType = tokenType;
     strcpy(previousLexeme, lexeme);
     do {
         readRow();
-    } while (isDiscarded(tokenType) || (tokenType == TOKEN_NEWLINE && groupDepth > 0));
+    } while (isDiscarded(tokenType)
+             || (tokenType == TOKEN_NEWLINE && (groupDepth > 0 || previousType == TOKEN_NEWLINE)));
 }
 
 static int addNode(int parent, const char *label, int token) {
