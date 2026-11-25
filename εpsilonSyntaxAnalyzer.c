@@ -203,6 +203,7 @@ static int pendingCount;
 static int panicMode;
 static int afterRecovery;
 static int offendingIsName;
+static int missingBraceReported;
 
 static int parseStatement(int parent);
 static int parseExpression(int parent);
@@ -276,10 +277,12 @@ static int isDiscarded(int type) {
 }
 
 static void getToken(void) {
+    int previousType = tokenType;
     strcpy(previousLexeme, lexeme);
     do {
         readRow();
-    } while (isDiscarded(tokenType) || (tokenType == TOKEN_NEWLINE && groupDepth > 0));
+    } while (isDiscarded(tokenType)
+             || (tokenType == TOKEN_NEWLINE && (groupDepth > 0 || previousType == TOKEN_NEWLINE)));
 }
 
 static int addNode(int parent, const char *label, int token) {
@@ -906,7 +909,11 @@ static void parseBlock(int parent, const char *name) {
         }
     }
     if (tokenType == TOKEN_END_OF_FILE) {
-        syntaxError("'}' expected to close the %s.", name);
+        if (!missingBraceReported) {
+            missingBraceReported = 1;
+            afterRecovery = 0;
+            syntaxError("'}' expected to close the %s.", name);
+        }
         return;
     }
     matchToken(node);
@@ -1126,11 +1133,12 @@ static void parseAssignment(int parent) {
         return;
     }
     if (operatorToken != TOKEN_ASSIGN) {
+        int result = operatorToken == TOKEN_DIVIDE_ASSIGN ? TYPE_DECIMAL : value;
         if (target != TYPE_UNKNOWN && target != TYPE_INTEGER && target != TYPE_DECIMAL && target != TYPE_VECTOR) {
             semanticError(line, "'%s' needs an integer, decimal, or vector variable, found %s '%s'.",
                           operatorText, typeName[target], name);
-        } else if (checkNumeric(value, operatorText, line) && target != TYPE_VECTOR && !canAssign(target, value)) {
-            semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[value], typeName[target], name);
+        } else if (checkNumeric(value, operatorText, line) && target != TYPE_VECTOR && !canAssign(target, result)) {
+            semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[result], typeName[target], name);
         }
     } else if (!canAssign(target, value)) {
         semanticError(line, "cannot assign %s to %s variable '%s'.", typeName[value], typeName[target], name);
